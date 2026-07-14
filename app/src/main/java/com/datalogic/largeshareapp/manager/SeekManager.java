@@ -2,6 +2,7 @@ package com.datalogic.largeshareapp.manager;
 
 import android.util.Log;
 
+import com.datalogic.largeshareapp.model.BitSetMetadata;
 import com.datalogic.largeshareapp.model.InformationMetadata;
 import com.datalogic.largeshareapp.model.Peer;
 import com.datalogic.largeshareapp.model.SharedData;
@@ -10,196 +11,281 @@ import com.datalogic.largeshareapp.storage.StorageManager;
 
 import java.util.BitSet;
 import java.util.Random;
-import java.util.concurrent.Callable;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.ExecutionException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Collectors;
 
 public class SeekManager {
     private static final String TAG = "LeechManager";
-    private final int EXECUTOR_CAPABILITY = 5;
+
     private final int IN_FLIGHT_PEER_LEECHING_LIMIT = 5;
     private final int IN_FLIGHT_CHUNK_LEECHING_LIMIT = 5;
+
     private final AtomicInteger mInFlightPeerLeeching = new AtomicInteger(0);
     private final Random mRandom = new Random();
-    private final ExecutorService mLeechExecutor = Executors.newFixedThreadPool(EXECUTOR_CAPABILITY);
-    private StorageManager mStorageManager;
-    private SharedData mSharedData = SharedData.getInstance();
+    private final ExecutorService mPeerExecutor =
+            Executors.newFixedThreadPool(IN_FLIGHT_PEER_LEECHING_LIMIT);
+    private final ExecutorService mChunkExecutor =
+            Executors.newFixedThreadPool(IN_FLIGHT_PEER_LEECHING_LIMIT * IN_FLIGHT_CHUNK_LEECHING_LIMIT);
 
-    public SeekManager() {
-    }
+    private final SharedData mSharedData = SharedData.getInstance();
+
+    private final Object mClaimLock = new Object();
+    private final Object mInitLock = new Object();
+
+    private final AtomicBoolean mAllComplete = new AtomicBoolean(false);
+
+    private volatile InformationMetadata mInformationMetadata;
+    private volatile BitSetMetadata mBitSetMetadata;
+    private volatile StorageManager mStorageManager;
+    private volatile int mTotalChunks;
+
+    public SeekManager() {}
 
     public synchronized boolean startLeeching(final Peer peer) {
         if (peer == null) {
             return false;
         }
-
+        if (mAllComplete.get()) {
+            return false;
+        }
         if (getBudget() <= 0) {
             return false;
         }
 
-        mLeechExecutor.submit(() -> {
-            leechFromPeer(peer);
-        });
+        // Reserve the slot up-front so concurrent callers see an accurate budget.
+        mInFlightPeerLeeching.incrementAndGet();
+        try {
+            mPeerExecutor.submit(() -> leechFromPeer(peer));
+        } catch (RuntimeException e) {
+            mInFlightPeerLeeching.decrementAndGet();
+            Log.e(TAG, "Failed to submit leech task for: " + peer, e);
+            return false;
+        }
         return true;
     }
 
     private void leechFromPeer(Peer peer) {
+        final AtomicBoolean isStop = new AtomicBoolean(false);
         try {
-            AtomicBoolean isStop = new AtomicBoolean(false);
-            if (SharedData.getInstance().instanceInformationMetadata == null) {
-                InformationMetadata informationMetadata = leechInformationMetadata(peer, isStop);
-                if (informationMetadata == null) {
-                    Log.e(TAG, "Information metadata could not be updated, stop leeching");
-                    return;
-                }
-                SharedData.getInstance().instanceInformationMetadata = informationMetadata;
-                Log.d(TAG, "Information metadata updated: " + informationMetadata);
-
-                mStorageManager = new StorageManager(informationMetadata);
+            if (!ensureInitialized(peer)) {
+                Log.e(TAG, "Could not initialize metadata from " + peer + ", stop leeching");
+                return;
             }
 
-            BitSet referenceBits = leechBitSetMetadata(peer);
-            BitSet currentBits = mSharedData.instanceBitSetMetadata.getAvailableChunks();
-            BitSet bitsToFetch = SecureManager.findAvailableBits(currentBits, referenceBits);
-//            CopyOnWriteArrayList<Integer> chunkIdsToFetch = availableBits
-//                                                            .stream()
-//                                                            .boxed()
-//                                                            .collect(
-//                                                                    Collectors.toCollection(CopyOnWriteArrayList::new));
-//            int budget = Math.min(IN_FLIGHT_CHUNK_LEECHING_LIMIT, bitsetAvailableChunks.cardinality());
-            int budget = 1;
-            for (int i = 0; i < budget; i++) {
-                mLeechExecutor.submit(() -> {
+            if (mAllComplete.get()) {
+                return;
+            }
+
+            final CountDownLatch done = new CountDownLatch(IN_FLIGHT_CHUNK_LEECHING_LIMIT);
+            for (int i = 0; i < IN_FLIGHT_CHUNK_LEECHING_LIMIT; i++) {
+                mChunkExecutor.submit(() -> {
                     try {
-                        leechChunkFromPeer(peer, isStop, bitsToFetch);
-                    } catch (ExecutionException | InterruptedException | TimeoutException e) {
-                        Log.d(TAG, "Error while leeching chunk from: " + peer, e);
+                        leechChunkLoop(peer, isStop);
+                    } catch (Exception e) {
+                        Log.e(TAG, "Chunk worker failed for peer: " + peer, e);
+                    } finally {
+                        done.countDown();
                     }
                 });
             }
+            done.await();
         } catch (Exception e) {
             Log.e(TAG, "Error while leeching from: " + peer, e);
+            Thread.currentThread().interrupt();
+        } finally {
+            peer.disconnect();
+            mInFlightPeerLeeching.decrementAndGet();
         }
     }
 
-    private void leechChunkFromPeer(final Peer peer, AtomicBoolean isStop, BitSet bitsToFetch)
-            throws ExecutionException, InterruptedException, TimeoutException {
-        if (isStop.get()) {
-            Log.d(TAG, "Leeching stopped for peer: " + peer);
-            return;
-        }
+    private void leechChunkLoop(final Peer peer, final AtomicBoolean isStop) {
+        BitSet referenceBits = leechBitSetMetadata(peer); // which chunks this peer can serve
 
-        // If there are no more chunk IDs to fetch, try to fetch metadata again
-        if (bitsToFetch.isEmpty()) {
-            BitSet referenceBits = leechBitSetMetadata(peer);
-            BitSet currentBits = mSharedData.instanceBitSetMetadata.getAvailableChunks();
-            bitsToFetch = SecureManager.findAvailableBits(currentBits, referenceBits);
+        while (!isStop.get() && !mAllComplete.get()) {
+            int chunkId = claimChunk(referenceBits);
+            if (chunkId < 0) {
+                if (isDownloadComplete()) {
+                    mAllComplete.set(true);
+                }
+                // Nothing left to claim from this peer's current view. Refresh one more time
+                // then give up on this peer if there is still nothing for us.
+                referenceBits = leechBitSetMetadata(peer);
+                chunkId = claimChunk(referenceBits);
+                if (chunkId < 0) {
+                    if (isDownloadComplete()) {
+                        mAllComplete.set(true);
+                    }
+                    return;
+                }
+            }
 
-            if (bitsToFetch.isEmpty()) {
-                Log.d(TAG, "No more chunks available from " + peer);
-                peer.disconnect();
+            if (!performFetchVerifyWriteChunk(peer, chunkId)) {
+                // Release the claim so another peer/worker can retry this chunk, then drop this peer.
+                compensateChunk(chunkId);
                 isStop.set(true);
+                peer.disconnect();
+                Log.e(TAG, "Stopping peer " + peer + " after failure on chunk " + chunkId);
+                return;
+            }
+
+            // Successfully persisted: publish progress to the shared metadata.
+            mBitSetMetadata.setAvailableChunk(chunkId, true);
+            Log.d(TAG, "Leeched chunk " + chunkId + " from " + peer);
+
+            if (isDownloadComplete()) {
+                mAllComplete.set(true);
                 return;
             }
         }
-
-        // Get the next chunk ID to fetch
-        int chunkId = getChunkToFetch(bitsToFetch);
-
-        // Fetch chunk data from the peer
-        Callable<byte[]> fetchChunkTask = () -> HttpClient.fetchChunk(peer.ip, peer.port, chunkId);
-        Future<byte[]> fetchChunkFuture = mLeechExecutor.submit(fetchChunkTask);
-        byte[] chunkData = fetchChunkFuture.get(HttpClient.CONNECT_TIMEOUT, TimeUnit.SECONDS);
-        if (chunkData == null || chunkData.length == 0) {
-            Log.e(TAG, "Failed to fetch chunk from: " + peer);
-            isStop.set(true);
-            peer.disconnect();
-            compensateChunk(chunkId, bitsToFetch);
-            return;
-        }
-
-        // Write chunk data to storage
-        Callable<Boolean> writeChunkTask = () -> mStorageManager.writeChunk(chunkId, chunkData);
-        Future<Boolean> writeChunkFuture = mLeechExecutor.submit(writeChunkTask);
-        Boolean wrote = writeChunkFuture.get(HttpClient.CONNECT_TIMEOUT, TimeUnit.SECONDS);
-        Log.d(TAG, "Wrote chunk " + chunkId + " to storage: " + wrote);
-        if (!wrote) {
-            Log.e(TAG, "Failed to write chunk " + chunkId + " to storage");
-            compensateChunk(chunkId, bitsToFetch);
-            return;
-        }
-
-        // Update the available chunks after successfully writing the chunk
-        mSharedData.instanceBitSetMetadata.setAvailableChunk(chunkId, true);
-
-        leechChunkFromPeer(peer, isStop, bitsToFetch);
     }
 
-    private InformationMetadata leechInformationMetadata(final Peer peer, AtomicBoolean isStop)
-            throws ExecutionException, InterruptedException, TimeoutException {
-        if (isStop.get()) {
-            return null;
-        }
-        Callable<InformationMetadata> fetchMetadataTask = () -> HttpClient.fetchInformationMetadata(peer.ip, peer.port);
-        Future<InformationMetadata> fetchMetadataFuture = mLeechExecutor.submit(fetchMetadataTask);
-        InformationMetadata informationMetadata = fetchMetadataFuture.get(HttpClient.CONNECT_TIMEOUT, TimeUnit.SECONDS);
-        if (informationMetadata == null) {
-            Log.e(TAG, "Failed to fetch metadata from: " + peer);
-            return null;
+    private int claimChunk(BitSet referenceBits) {
+        final BitSetMetadata currentBitSetMetadata = mBitSetMetadata;
+        if (referenceBits == null || referenceBits.isEmpty() || currentBitSetMetadata == null) {
+            return -1;
         }
 
-        return informationMetadata;
+        synchronized (mClaimLock) {
+            BitSet candidates = (BitSet) referenceBits.clone();
+            candidates.andNot(currentBitSetMetadata.getAvailableChunks()); // drop chunks we already have
+            candidates.andNot(currentBitSetMetadata.getRequestedChunks()); // drop chunks already in-flight
+
+            int count = candidates.cardinality();
+            if (count == 0) {
+                // No claimable chunks available.
+                return -1;
+            }
+
+            // Pick a random claimable chunk
+            int target = mRandom.nextInt(count);
+            int chunkId = candidates.nextSetBit(0);
+            for (int i = 0; i < target; i++) {
+                chunkId = candidates.nextSetBit(chunkId + 1);
+            }
+
+            currentBitSetMetadata.setRequestedChunk(chunkId, true);
+            return chunkId;
+        }
+    }
+
+    private void compensateChunk(int chunkId) {
+        if (chunkId < 0 || mBitSetMetadata == null) {
+            return;
+        }
+        mBitSetMetadata.setRequestedChunk(chunkId, false);
+    }
+
+    private boolean performFetchVerifyWriteChunk(final Peer peer, int chunkId) {
+        try {
+            byte[] chunkData = HttpClient.fetchChunk(peer.ip, peer.port, chunkId);
+            if (chunkData.length == 0) {
+                Log.e(TAG, "Empty chunk " + chunkId + " from " + peer);
+                return false;
+            }
+            if (!mStorageManager.verifyChunk(chunkId, chunkData)) {
+                Log.e(TAG, "Chunk " + chunkId + " failed hash verification from " + peer);
+                return false;
+            }
+            if (!mStorageManager.writeChunk(chunkId, chunkData)) {
+                Log.e(TAG, "Failed to write chunk " + chunkId + " from " + peer);
+                return false;
+            }
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to fetch/write chunk " + chunkId + " from " + peer, e);
+            return false;
+        }
+    }
+
+    private boolean isDownloadComplete() {
+        final BitSetMetadata meta = mBitSetMetadata;
+        if (meta == null || mTotalChunks <= 0) {
+            return false;
+        }
+        return meta.getAvailableChunks().cardinality() >= mTotalChunks;
+    }
+
+    /**
+     * One-time, thread-safe initialization of the information metadata, chunk bitset and storage.
+     * The first peer thread to arrive fetches the metadata; all others reuse it.
+     */
+    private boolean ensureInitialized(final Peer peer) {
+        if (mInformationMetadata != null && mBitSetMetadata != null && mStorageManager != null) {
+            return true;
+        }
+
+        synchronized (mInitLock) {
+            if (mInformationMetadata == null || mBitSetMetadata == null || mStorageManager == null) {
+                InformationMetadata metadata = mSharedData.instanceInformationMetadata;
+                if (metadata == null) {
+                    metadata = leechInformationMetadata(peer);
+                    if (metadata == null) {
+                        return false;
+                    }
+                }
+
+                StorageManager storageManager;
+                try {
+                    storageManager = new StorageManager(metadata);
+                } catch (IllegalStateException e) {
+                    Log.e(TAG, "Failed to initialize storage for " + metadata.getFileShared(), e);
+                    return false;
+                }
+
+                int totalChunks = metadata.getChunkHashes().length;
+                BitSetMetadata bitSetMetadata = mSharedData.instanceBitSetMetadata;
+                if (bitSetMetadata == null) {
+                    bitSetMetadata = new BitSetMetadata(totalChunks);
+                }
+
+                // Publish locally (correct visibility for workers) and to SharedData (for others).
+                mStorageManager = storageManager;
+                mTotalChunks = totalChunks;
+                mBitSetMetadata = bitSetMetadata;
+                mInformationMetadata = metadata;
+                mSharedData.instanceBitSetMetadata = bitSetMetadata;
+                mSharedData.instanceInformationMetadata = metadata;
+
+                Log.d(TAG, "Initialized leeching for " + totalChunks + " chunks: " + metadata);
+            }
+        }
+        return mInformationMetadata != null && mBitSetMetadata != null && mStorageManager != null;
+    }
+
+    private InformationMetadata leechInformationMetadata(final Peer peer) {
+        try {
+            InformationMetadata metadata = HttpClient.fetchInformationMetadata(peer.ip, peer.port);
+            if (metadata == null) {
+                Log.e(TAG, "Failed to fetch metadata from: " + peer);
+            }
+            return metadata;
+        } catch (Exception e) {
+            Log.e(TAG, "Error fetching metadata from: " + peer, e);
+            return null;
+        }
     }
 
     private BitSet leechBitSetMetadata(final Peer peer) {
-        Callable<BitSet> fetchBitSetTask = () -> {
-            return HttpClient.fetchBitSet(peer.ip, peer.port);
-        };
-        Future<BitSet> fetchBitSetFuture = mLeechExecutor.submit(fetchBitSetTask);
         try {
-            return fetchBitSetFuture.get(HttpClient.CONNECT_TIMEOUT, TimeUnit.SECONDS);
-        } catch (ExecutionException | InterruptedException | TimeoutException e) {
-            Log.e(TAG, "Failed to fetch bit set metadata", e);
+            BitSet bitSet = HttpClient.fetchBitSet(peer.ip, peer.port);
+            return bitSet != null ? bitSet : new BitSet();
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to fetch bit set metadata from: " + peer, e);
+            return new BitSet();
         }
-        return new BitSet();
     }
 
     public synchronized int getBudget() {
         return IN_FLIGHT_PEER_LEECHING_LIMIT - mInFlightPeerLeeching.get();
     }
 
-    private synchronized int getChunkToFetch(BitSet bitsToFetch) {
-        if (bitsToFetch == null || bitsToFetch.isEmpty()) {
-            return -1;
-        }
-        BitSet availableBitsToFetch = SecureManager.findAvailableBits(
-                mSharedData.instanceBitSetMetadata.getRequestedChunks(), bitsToFetch);
-        CopyOnWriteArrayList<Integer> availableChunkIdsToFetch = availableBitsToFetch
-                                        .stream()
-                                        .boxed()
-                                        .collect(
-                                                Collectors.toCollection(CopyOnWriteArrayList::new));
-        int randomIndex = mRandom.nextInt(availableChunkIdsToFetch.size());
-        int chunkId = availableChunkIdsToFetch.get(randomIndex);
-
-        bitsToFetch.set(chunkId, false);
-        // TODO
-        mSharedData.instanceBitSetMetadata.setRequestedChunk(chunkId, true);
-
-        return chunkId;
-    }
-
-    private synchronized void compensateChunk(int chunkId, BitSet bitsToFetch) {
-        mSharedData.instanceBitSetMetadata.setRequestedChunk(chunkId, false);
-        // TODO
-        bitsToFetch.set(chunkId, true);
+    /** Stops accepting new work and shuts down both thread layers. */
+    public void stop() {
+        mAllComplete.set(true);
+        mChunkExecutor.shutdownNow();
+        mPeerExecutor.shutdownNow();
     }
 }
