@@ -11,6 +11,9 @@ public class Peer {
     public final String serviceType;
     private final AtomicBoolean isConnected = new AtomicBoolean(false);
 
+    public Peer(String ip, int port) {
+        this(ip, port, null, null);
+    }
     public Peer(String ip, int port, String serviceName, String serviceType) {
         this.ip = ip;
         this.port = port;

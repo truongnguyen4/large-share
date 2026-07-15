@@ -32,7 +32,7 @@ public class SecureManager {
         }
     }
 
-    public static InformationMetadata createFileMetadata(File fileShared, int chunkSize, ShareManager.DiscoveryRole role) {
+    public static InformationMetadata createFileMetadata(File fileShared, int chunkSize) {
         if (fileShared == null) {
             Log.e(TAG, "Invalid file URI or size");
             return null;

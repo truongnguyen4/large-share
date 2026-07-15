@@ -36,6 +36,15 @@ public class StorageManager {
                 Log.e(TAG, "File shared is null.");
                 return false;
             }
+            if (!fileShared.exists()) {
+                File parentDir = fileShared.getParentFile();
+                if (parentDir != null && !parentDir.exists()) {
+                    if (!parentDir.mkdirs()) {
+                        Log.e(TAG, "Failed to create parent directory: " + parentDir.getAbsolutePath());
+                        return false;
+                    }
+                }
+            }
             RandomAccessFile raf = new RandomAccessFile(fileShared, "rw");
             mFileChannel = raf.getChannel();
             mFileChannel.truncate(mMetadata.getFileSize());

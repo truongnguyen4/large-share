@@ -217,8 +217,7 @@ public class MainActivity extends AppCompatActivity {
         Executors.newSingleThreadExecutor().execute(() -> {
             InformationMetadata informationMetadata = SecureManager.createFileMetadata(
                     mFileShared,
-                    SecureManager.CHUNK_SIZE_524KB,
-                    mDiscoveryRole);
+                    SecureManager.CHUNK_SIZE_524KB);
 
             runOnUiThread(() -> {
                 tvSelectedFileInfo.setText( uri.getPath());
@@ -250,6 +249,9 @@ public class MainActivity extends AppCompatActivity {
         Log.d(TAG, "Starting sharing - Mode: " + mDiscoveryMode);
         shareManager = new ShareManager(MainActivity.this, mFileShared, mDiscoveryMode);
         shareManager.startSharing(mDiscoveryRole);
+        if (mDiscoveryRole == ShareManager.DiscoveryRole.SEEDER) {
+            shareManager.trackSharing();
+        }
     }
 
     private void showMetadataInfo(InformationMetadata meta) {

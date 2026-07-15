@@ -6,6 +6,8 @@ import android.util.Log;
 
 import com.datalogic.largeshareapp.model.InformationMetadata;
 
+import org.json.JSONObject;
+
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
@@ -13,9 +15,11 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -24,9 +28,10 @@ public class HttpServer {
 
     public static final String GET = "GET";
     public static final String POST = "POST";
-    public static final int ERROR_UNSUPPORTED = 303;
-    public static final int ERROR_TIMEOUT = 403;
-    public static final int ERROR_REQUEST_CORRUPTED = 400;
+    public static final int RESPONSE_ERROR_UNSUPPORTED = 303;
+    public static final int RESPONSE_ERROR_TIMEOUT = 403;
+    public static final int RESPONSE_ERROR_REQUEST_CORRUPTED = 400;
+    public static final int RESPONSE_SUCCESS = 200;
 
     private final int EXECUTOR_CAPABILITY = 10;
     private final int REQUEST_TIMEOUT = 5000;
@@ -35,12 +40,13 @@ public class HttpServer {
     private ServerSocket mServerSocket;
     private ExecutorService mServerExecutor = Executors.newFixedThreadPool(EXECUTOR_CAPABILITY);;
     private final AtomicBoolean mIsRunning = new AtomicBoolean(false);
-    private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     private InformationMetadata mMetadata;
     private Supplier<byte[]> mGetMetadataResponse;
     private Supplier<byte[]> mGetBitsetResponse;
     private Function<Integer, byte[]> mGetChunkResponse;
+    private Consumer<String> mPostProgressResponse;
+    private volatile ServerListener mServerListener;
 
     public interface ServerListener {
         void onProgressReportReceived(String deviceId, String ip, int completed, int total, int failures);
@@ -50,10 +56,15 @@ public class HttpServer {
         this.mPort = port;
     }
 
+    public void setServerListener(ServerListener listener) {
+        this.mServerListener = listener;
+    }
+
     public synchronized void start(InformationMetadata metadata,
                                    Supplier<byte[]> getMetadataResponse,
                                    Supplier<byte[]> getBitsetResponse,
-                                   Function<Integer, byte[]> getChunkResponse)
+                                   Function<Integer, byte[]> getChunkResponse,
+                                   Consumer<String> postProgressResponse)
             throws IOException, IllegalArgumentException {
         if (metadata == null || getMetadataResponse == null
             || getBitsetResponse == null || getChunkResponse == null) {
@@ -68,6 +79,7 @@ public class HttpServer {
         this.mGetMetadataResponse = getMetadataResponse;
         this.mGetBitsetResponse = getBitsetResponse;
         this.mGetChunkResponse = getChunkResponse;
+        this.mPostProgressResponse = postProgressResponse;
 
         // Limiting thread pool to avoid overwhelming CPU/network
         mServerSocket = new ServerSocket(mPort);
@@ -119,115 +131,147 @@ public class HttpServer {
     private void handleClient(Socket socket) {
         try (socket) {
             socket.setSoTimeout(REQUEST_TIMEOUT);
+            socket.setTcpNoDelay(true);
+            String clientIp = socket.getInetAddress() != null
+                    ? socket.getInetAddress().getHostAddress() : "";
             InputStream is = socket.getInputStream();
             OutputStream os = socket.getOutputStream();
 
+            // Reuse the same reader/stream so one TCP connection can serve many
+            // requests (HTTP keep-alive) instead of a fresh connection per chunk.
             BufferedReader reader = new BufferedReader(new InputStreamReader(is));
-            String requestLine = reader.readLine();
-            if (requestLine == null) {
-                socket.close();
-                return;
-            }
 
-            String[] parts = requestLine.split(" ");
-            if (parts.length < 2) {
-                responseError(os, ERROR_REQUEST_CORRUPTED, "Bad Request");
-                return;
-            }
-
-            String method = parts[0];
-            String path = parts[1];
-            String query = "";
-            int queryIndex = path.indexOf('?');
-            if (queryIndex != -1) {
-                query = path.substring(queryIndex + 1);
-                path = path.substring(0, queryIndex);
-            }
-
-            // Consume headers
-            {
-                String line;
-                while (!(line = reader.readLine()).isEmpty()) {
-                    if (line.toLowerCase().startsWith("content-length:")) {
-                        Integer.parseInt(line.substring(15).trim());
-                    }
-                }
-            }
-
-            switch (method) {
-                case GET:{
-                    switch (path) {
-                        case "/metadata": {
-                            response(os, mGetMetadataResponse);
-                            break;
-                        }
-                        case "/bitset": {
-                            response(os, mGetBitsetResponse);
-                            break;
-                        }
-                        case "/chunk": {
-                            int chunkId = Integer.parseInt(query.replace("id=", ""));
-                            response(os, mGetChunkResponse, chunkId);
-                            break;
-                        }
-                        default: {
-                            Log.e(TAG, "Unsupported GET path: " + path);
-                            responseError(os, ERROR_UNSUPPORTED, "Not Found");
-                        }
-                    }
+            while (mIsRunning.get()) {
+                boolean keepAlive;
+                try {
+                    keepAlive = handleRequest(reader, os, clientIp);
+                    os.flush();
+                } catch (SocketTimeoutException e) {
+                    // Idle persistent connection: no further request arrived in time.
                     break;
                 }
-                case POST:{
-                    switch (path) {
-                        case "/progress": {
-                            Log.d(TAG, "Have not implemented!!!");
-                            responseError(os, ERROR_UNSUPPORTED, "Not Found");
-
-                            break;
-                        }
-                        case "/status": {
-                            Log.d(TAG, "Have not implemented!!!");
-                            responseError(os, ERROR_UNSUPPORTED, "Not Found");
-                            break;
-                        }
-                        default: {
-                            Log.e(TAG, "Unsupported POST path: " + path);
-                            responseError(os, ERROR_UNSUPPORTED, "Not Found");
-                        }
-                    }
+                if (!keepAlive) {
                     break;
                 }
-                default: {
-                    Log.e(TAG, "Unsupported HTTP method: " + method);
-                    responseError(os, 501, "Not Implemented");
-                }
             }
-            os.flush();
         } catch (Exception e) {
-            Log.e(TAG, "Error closing client socket", e);
+            Log.e(TAG, "Error handling client socket", e);
         }
     }
 
-    private void response(OutputStream os, Function<Integer, byte[]> getResponse, int chunkId) throws Exception {
-        if (mMetadata == null) {
-            responseError(os, 500, "Metadata not available");
-            return;
+    private boolean handleRequest(BufferedReader reader, OutputStream os, String clientIp) throws Exception {
+        String requestLine = reader.readLine();
+        if (requestLine == null) {
+            return false; // peer closed the connection
         }
 
-        byte[] bytes = getResponse.apply(chunkId);
+        String[] parts = requestLine.split(" ");
+        if (parts.length < 2) {
+            responseCode(os, RESPONSE_ERROR_REQUEST_CORRUPTED, "Bad Request", false);
+            return false;
+        }
 
-        String responseHeaders = "HTTP/1.1 200 OK\r\n" +
-                "Content-Type: application/json\r\n" +
-                "Content-Length: " + bytes.length + "\r\n" +
-                "Connection: close\r\n\r\n";
+        String method = parts[0];
+        String path = parts[1];
+        String query = "";
+        int queryIndex = path.indexOf('?');
+        if (queryIndex != -1) {
+            query = path.substring(queryIndex + 1);
+            path = path.substring(0, queryIndex);
+        }
 
-        os.write(responseHeaders.getBytes("UTF-8"));
-        os.write(bytes);
+        // Consume headers, capturing the body length and the peer's keep-alive preference.
+        int contentLength = 0;
+        boolean keepAlive = true;
+        String line;
+        while ((line = reader.readLine()) != null && !line.isEmpty()) {
+            String lower = line.toLowerCase();
+            if (lower.startsWith("content-length:")) {
+                try {
+                    contentLength = Integer.parseInt(line.substring(15).trim());
+                } catch (NumberFormatException e) {
+                    Log.e(TAG, "Malformed Content-Length header: " + line);
+                }
+            } else if (lower.startsWith("connection:")) {
+                keepAlive = !lower.contains("close");
+            }
+        }
+
+        switch (method) {
+            case GET:{
+                switch (path) {
+                    case "/metadata": {
+                        response(os, mGetMetadataResponse, keepAlive);
+                        break;
+                    }
+                    case "/bitset": {
+                        response(os, mGetBitsetResponse, keepAlive);
+                        break;
+                    }
+                    case "/chunk": {
+                        int chunkId = Integer.parseInt(query.replace("id=", ""));
+                        response(os, () -> mGetChunkResponse.apply(chunkId), keepAlive);
+                        break;
+                    }
+                    default: {
+                        Log.e(TAG, "Unsupported GET path: " + path);
+                        responseCode(os, RESPONSE_ERROR_UNSUPPORTED, "Not Found", false);
+                        return false;
+                    }
+                }
+                break;
+            }
+            case POST:{
+                String body = preprocessPostRequest(reader, contentLength);
+                switch (path) {
+                    case "/progress": {
+                        mPostProgressResponse.accept(body);
+                        responseCode(os, RESPONSE_SUCCESS, "OK", keepAlive);
+                        break;
+                    }
+                    case "/status": {
+                        Log.d(TAG, "Have not implemented!!!");
+                        responseCode(os, RESPONSE_ERROR_UNSUPPORTED, "Not Found", false);
+                        return false;
+                    }
+                    default: {
+                        Log.e(TAG, "Unsupported POST path: " + path);
+                        responseCode(os, RESPONSE_ERROR_UNSUPPORTED, "Not Found", false);
+                        return false;
+                    }
+                }
+                break;
+            }
+            default: {
+                Log.e(TAG, "Unsupported HTTP method: " + method);
+                responseCode(os, 501, "Not Implemented", false);
+                return false;
+            }
+        }
+        return keepAlive;
     }
 
-    private void response(OutputStream os, Supplier<byte[]> getResponse) throws Exception {
+    private String preprocessPostRequest(BufferedReader reader, int contentLength) throws IOException {
+        if (contentLength <= 0) {
+            return "";
+        }
+
+        // Read exactly contentLength characters of the body.
+        char[] bodyChars = new char[contentLength];
+        int read = 0;
+        while (read < contentLength) {
+            int r = reader.read(bodyChars, read, contentLength - read);
+            if (r == -1) {
+                break;
+            }
+            read += r;
+        }
+        return new String(bodyChars, 0, read);
+    }
+
+    private void response(OutputStream os, Supplier<byte[]> getResponse, boolean keepAlive) throws Exception {
         if (mMetadata == null) {
-            responseError(os, 500, "Metadata not available");
+            responseCode(os, 500, "Metadata not available", false);
             return;
         }
 
@@ -236,136 +280,17 @@ public class HttpServer {
         String responseHeaders = "HTTP/1.1 200 OK\r\n" +
                 "Content-Type: application/json\r\n" +
                 "Content-Length: " + bytes.length + "\r\n" +
-                "Connection: close\r\n\r\n";
+                "Connection: " + (keepAlive ? "keep-alive" : "close") + "\r\n\r\n";
 
         os.write(responseHeaders.getBytes("UTF-8"));
         os.write(bytes);
     }
 
-    private void responseError(OutputStream os, int code, String msg) throws IOException {
+    private void responseCode(OutputStream os, int code, String msg, boolean keepAlive) throws IOException {
         String resp = "HTTP/1.1 " + code + " " + msg + "\r\n" +
                 "Content-Length: " + msg.length() + "\r\n" +
-                "Connection: close\r\n\r\n" + msg;
+                "Connection: " + (keepAlive ? "keep-alive" : "close") + "\r\n\r\n" + msg;
         os.write(resp.getBytes("UTF-8"));
     }
-
-//    private void sendBitmapResponse(OutputStream os) throws Exception {
-//        int total = storageManager.getTotalChunks();
-//        StringBuilder sb = new StringBuilder();
-//        for (int i = 0; i < total; i++) {
-//            sb.append(storageManager.isChunkPossessed(i) ? '1' : '0');
-//        }
-//
-//        byte[] bytes = sb.toString().getBytes("UTF-8");
-//        String responseHeaders = "HTTP/1.1 200 OK\r\n" +
-//                "Content-Type: text/plain\r\n" +
-//                "Content-Length: " + bytes.length + "\r\n" +
-//                "Connection: close\r\n\r\n";
-//
-//        os.write(responseHeaders.getBytes("UTF-8"));
-//        os.write(bytes);
-//    }
-
-//    private void handleChunkRequest(String path, OutputStream os) throws Exception {
-//        // Query syntax: /chunk?id=49 or /chunk/random (sends a random chunk)
-//        int chunkId = -1;
-//        if (path.contains("id=")) {
-//            try {
-//                String idStr = path.substring(path.indexOf("id=") + 3);
-//                if (idStr.contains("&")) {
-//                    idStr = idStr.substring(0, idStr.indexOf('&'));
-//                }
-//                chunkId = Integer.parseInt(idStr);
-//            } catch (Exception e) {
-//                sendErrorResponse(os, 400, "Invalid Chunk ID parameter");
-//                return;
-//            }
-//        } else if (path.contains("random")) {
-//            // Priority constraint: Distributor must send a random chunk to avoid jam
-//            // Choose a random chunk from possessed ones
-//            int total = storageManager.getTotalChunks();
-//            int attempts = 0;
-//            while (attempts < 100) {
-//                int r = random.nextInt(total);
-//                if (storageManager.isChunkPossessed(r)) {
-//                    chunkId = r;
-//                    break;
-//                }
-//                attempts++;
-//            }
-//            if (chunkId == -1) {
-//                // fallback to finding the first possessed chunk
-//                for (int i = 0; i < total; i++) {
-//                    if (storageManager.isChunkPossessed(i)) {
-//                        chunkId = i;
-//                        break;
-//                    }
-//                }
-//            }
-//        }
-//
-//        if (chunkId == -1 || !storageManager.isChunkPossessed(chunkId)) {
-//            sendErrorResponse(os, 404, "Chunk not possessed/available: " + chunkId);
-//            return;
-//        }
-//
-//        byte[] chunkData = storageManager.readChunk(chunkId);
-//        if (chunkData == null) {
-//            sendErrorResponse(os, 500, "Failed to read chunk data");
-//            return;
-//        }
-//
-//        String responseHeaders = "HTTP/1.1 200 OK\r\n" +
-//                "Content-Type: application/octet-stream\r\n" +
-//                "Content-Length: " + chunkData.length + "\r\n" +
-//                "X-Chunk-Index: " + chunkId + "\r\n" +
-//                "Connection: close\r\n\r\n";
-//
-//        os.write(responseHeaders.getBytes("UTF-8"));
-//        os.write(chunkData);
-//    }
-
-//    private void handleProgressPost(BufferedReader reader, int contentLength, OutputStream os, String clientIp)
-//            throws Exception {
-//        if (contentLength <= 0) {
-//            sendErrorResponse(os, 400, "Missing content length for updates");
-//            return;
-//        }
-//
-//        char[] bodyChars = new char[contentLength];
-//        int read = 0;
-//        while (read < contentLength) {
-//            int r = reader.read(bodyChars, read, contentLength - read);
-//            if (r == -1)
-//                break;
-//            read += r;
-//        }
-//
-//        String body = new String(bodyChars);
-//        try {
-//            JSONObject json = new JSONObject(body);
-//            String deviceId = json.getString("deviceId");
-//            int completed = json.getInt("completed");
-//            int total = json.getInt("total");
-//            int failures = json.getInt("failures");
-//
-//            if (listener != null) {
-//                mainHandler
-//                        .post(() -> listener.onProgressReportReceived(deviceId, clientIp, completed, total, failures));
-//            }
-//
-//            String response = "{\"status\":\"ok\"}";
-//            byte[] respBytes = response.getBytes("UTF-8");
-//            String responseHeaders = "HTTP/1.1 200 OK\r\n" +
-//                    "Content-Type: application/json\r\n" +
-//                    "Content-Length: " + respBytes.length + "\r\n" +
-//                    "Connection: close\r\n\r\n";
-//            os.write(responseHeaders.getBytes("UTF-8"));
-//            os.write(respBytes);
-//        } catch (Exception e) {
-//            sendErrorResponse(os, 400, "Malformed json body");
-//        }
-//    }
-
 
 }

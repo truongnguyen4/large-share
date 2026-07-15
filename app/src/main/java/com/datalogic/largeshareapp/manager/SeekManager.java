@@ -16,12 +16,21 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 public class SeekManager {
     private static final String TAG = "LeechManager";
-
+    private static final int PROGRESS_10_CHUNK_COMPLETED = 1;
     private final int IN_FLIGHT_PEER_LEECHING_LIMIT = 5;
-    private final int IN_FLIGHT_CHUNK_LEECHING_LIMIT = 5;
+    private final int IN_FLIGHT_CHUNK_LEECHING_LIMIT = 1;
+
+    public interface LeechEventListener {
+        void onMetadataReady(InformationMetadata metadata);
+
+        void onChunkBatchLeeched(int completed, int total);
+
+        void onLeechingCompleted();
+    }
 
     private final AtomicInteger mInFlightPeerLeeching = new AtomicInteger(0);
     private final Random mRandom = new Random();
@@ -36,13 +45,19 @@ public class SeekManager {
     private final Object mInitLock = new Object();
 
     private final AtomicBoolean mAllComplete = new AtomicBoolean(false);
+    private final AtomicInteger mCompletedChunks = new AtomicInteger(0);
 
     private volatile InformationMetadata mInformationMetadata;
     private volatile BitSetMetadata mBitSetMetadata;
     private volatile StorageManager mStorageManager;
     private volatile int mTotalChunks;
+    private volatile LeechEventListener mLeechEventListener;
 
     public SeekManager() {}
+
+    public void setLeechEventListener(LeechEventListener listener) {
+        this.mLeechEventListener = listener;
+    }
 
     public synchronized boolean startLeeching(final Peer peer) {
         if (peer == null) {
@@ -107,20 +122,20 @@ public class SeekManager {
         while (!isStop.get() && !mAllComplete.get()) {
             int chunkId = claimChunk(referenceBits);
             if (chunkId < 0) {
-                if (isDownloadComplete()) {
-                    mAllComplete.set(true);
-                }
                 // Nothing left to claim from this peer's current view. Refresh one more time
                 // then give up on this peer if there is still nothing for us.
+                PerformanceTracker.startRecord("refreshBitSet", System.currentTimeMillis());
                 referenceBits = leechBitSetMetadata(peer);
+                PerformanceTracker.endRecord("refreshBitSet", System.currentTimeMillis());
                 chunkId = claimChunk(referenceBits);
                 if (chunkId < 0) {
                     if (isDownloadComplete()) {
-                        mAllComplete.set(true);
+                        notifySeekProgress(listener -> listener.onLeechingCompleted());
                     }
                     return;
                 }
             }
+            PerformanceTracker.startRecord("leechChunk-" + chunkId , System.currentTimeMillis());
 
             if (!performFetchVerifyWriteChunk(peer, chunkId)) {
                 // Release the claim so another peer/worker can retry this chunk, then drop this peer.
@@ -131,13 +146,40 @@ public class SeekManager {
                 return;
             }
 
-            // Successfully persisted: publish progress to the shared metadata.
-            mBitSetMetadata.setAvailableChunk(chunkId, true);
-            Log.d(TAG, "Leeched chunk " + chunkId + " from " + peer);
+            Log.d(TAG, "Successfully leeched chunk " + chunkId + " from " + peer.ip);
+            onSeekChunkSuccessful(chunkId);
 
-            if (isDownloadComplete()) {
-                mAllComplete.set(true);
+            if (mAllComplete.get()) {
                 return;
+            }
+            PerformanceTracker.endRecord("leechChunk-" + chunkId, System.currentTimeMillis());
+        }
+    }
+
+    private void onSeekChunkSuccessful(int chunkId) {
+        mBitSetMetadata.setAvailableChunk(chunkId, true);
+        int completed = mCompletedChunks.incrementAndGet();
+        int total = mTotalChunks;
+
+        boolean isUpdate = completed % PROGRESS_10_CHUNK_COMPLETED == 0;
+        if (isUpdate) {
+            notifySeekProgress(listener -> listener.onChunkBatchLeeched(completed, total));
+        }
+
+        boolean complete = completed >= total;
+        if (complete) {
+            notifySeekProgress(listener -> listener.onLeechingCompleted());
+            notifySeekProgress(listener -> listener.onChunkBatchLeeched(completed, total));
+        }
+    }
+
+    private void notifySeekProgress(Consumer<LeechEventListener> callback) {
+        LeechEventListener listener = mLeechEventListener;
+        if (listener != null) {
+            try {
+                callback.accept(listener);
+            } catch (Exception e) {
+                Log.e(TAG, "LeechEventListener callback failed", e);
             }
         }
     }
@@ -180,19 +222,27 @@ public class SeekManager {
 
     private boolean performFetchVerifyWriteChunk(final Peer peer, int chunkId) {
         try {
+            PerformanceTracker.startRecord("fetchChunk-" + chunkId, System.currentTimeMillis());
             byte[] chunkData = HttpClient.fetchChunk(peer.ip, peer.port, chunkId);
             if (chunkData.length == 0) {
                 Log.e(TAG, "Empty chunk " + chunkId + " from " + peer);
                 return false;
             }
+            PerformanceTracker.endRecord("fetchChunk-" + chunkId, System.currentTimeMillis());
+
+            PerformanceTracker.startRecord("verifyChunk-" + chunkId, System.currentTimeMillis());
             if (!mStorageManager.verifyChunk(chunkId, chunkData)) {
                 Log.e(TAG, "Chunk " + chunkId + " failed hash verification from " + peer);
                 return false;
             }
+            PerformanceTracker.endRecord("verifyChunk-" + chunkId, System.currentTimeMillis());
+
+            PerformanceTracker.startRecord("writeChunk-" + chunkId, System.currentTimeMillis());
             if (!mStorageManager.writeChunk(chunkId, chunkData)) {
                 Log.e(TAG, "Failed to write chunk " + chunkId + " from " + peer);
                 return false;
             }
+            PerformanceTracker.endRecord("writeChunk-" + chunkId, System.currentTimeMillis());
             return true;
         } catch (Exception e) {
             Log.e(TAG, "Failed to fetch/write chunk " + chunkId + " from " + peer, e);
@@ -217,6 +267,7 @@ public class SeekManager {
             return true;
         }
 
+        boolean initializedNow = false;
         synchronized (mInitLock) {
             if (mInformationMetadata == null || mBitSetMetadata == null || mStorageManager == null) {
                 InformationMetadata metadata = mSharedData.instanceInformationMetadata;
@@ -248,11 +299,25 @@ public class SeekManager {
                 mInformationMetadata = metadata;
                 mSharedData.instanceBitSetMetadata = bitSetMetadata;
                 mSharedData.instanceInformationMetadata = metadata;
+                initializedNow = true;
 
                 Log.d(TAG, "Initialized leeching for " + totalChunks + " chunks: " + metadata);
             }
         }
-        return mInformationMetadata != null && mBitSetMetadata != null && mStorageManager != null;
+
+        boolean ready = mInformationMetadata != null && mBitSetMetadata != null && mStorageManager != null;
+        // Fire the callback outside the init lock to avoid holding it across coordinator work.
+        if (initializedNow && ready) {
+            LeechEventListener listener = mLeechEventListener;
+            if (listener != null) {
+                try {
+                    listener.onMetadataReady(mInformationMetadata);
+                } catch (Exception e) {
+                    Log.e(TAG, "onMetadataReady callback failed", e);
+                }
+            }
+        }
+        return ready;
     }
 
     private InformationMetadata leechInformationMetadata(final Peer peer) {
