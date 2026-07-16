@@ -33,56 +33,39 @@ public class ShareManager {
     private static final int HTTP_PORT = 8888;
     private static final int MAX_PEER_CONNECTIONS = 3;
 
-    private final int IN_FLIGHT_PEER_LEECHING_LIMIT = 3;
-    private final Map<String, Peer> mInFlightPeersSeeding = new ConcurrentHashMap<>();
-    private final Map<String, Peer> mInFlightPeersLeeching = new ConcurrentHashMap<>();
-
     private final DiscoveryMode mDiscoveryMode;
+    private final String mDeviceId;
     private File mFileShared;
-    private StorageManager mStorageManager = null;
-    private final Set<ShareListener> mShareListeners = new CopyOnWriteArraySet<>();
     private final Context mContext;
-
     // Core components
     private HttpServer httpServer;
     private NsdDiscoveryManager nsdManager;
     private WifiDirectDiscoveryManager wifiDirectManager;
-
-    // Discovery options
-    private DiscoveryMode discoveryMode;
-    private boolean isSharingStarted = false;
-    private boolean isDownloadingFinished = false;
-
     // Concurrency / Thread pools
     private ExecutorService mHttpExecutor = Executors.newFixedThreadPool(MAX_PEER_CONNECTIONS);
     private ExecutorService mSeedingExecutor = Executors.newFixedThreadPool(MAX_PEER_CONNECTIONS);
-
-    private final Set<String> activeDistributorAddresses = ConcurrentHashMap.newKeySet();
-    private final Map<String, PeerProgress> peerProgressMap = new ConcurrentHashMap<>();
-
-    private final AtomicInteger receivedChunksCounterSinceReport = new AtomicInteger(0);
-    private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final Random random = new Random();
     private final Map<String, Peer> peerMap = new ConcurrentHashMap<>();
-
     private volatile Peer mRootPeer;
-    // Ensures a leecher only promotes itself to a seeder once.
-    private final AtomicBoolean mIsSeedingStarted = new AtomicBoolean(false);
-
     private SeekManager mSeekManager;
     private SeedManager mSeedManager;
+
+    // After leeching finishes we keep seeding for a short grace period so other peers
+    // can still pull chunks from us before we leave the network.
+    public static final long STOP_SEED_DELAY_MS = 15_000L;
+    private final Handler mMainHandler = new Handler(Looper.getMainLooper());
+    private final Runnable mStopSeedRunnable = this::stopSeed;
 
     public static class PeerProgress {
         public String ip;
         public int completed;
         public int total;
-        public int failures;
+        public String deviceId;
 
-        public PeerProgress(String ip, int completed, int total, int failures) {
+        public PeerProgress(String ip, int completed, int total, String deviceId) {
             this.ip = ip;
             this.completed = completed;
             this.total = total;
-            this.failures = failures;
+            this.deviceId = deviceId;
         }
     }
 
@@ -96,18 +79,6 @@ public class ShareManager {
         UNKNOWN,
         SEEDER,
         SEEKER;
-    }
-
-    public interface ShareListener {
-        void onStatusUpdated(String status);
-
-        void onProgressUpdated(int completed, int total, int failures);
-
-        void onPeerProgressUpdated(Map<String, PeerProgress> progressMap);
-
-        void onDownloadCompleted(boolean success);
-
-        void onServiceStopped();
     }
 
     private final NsdDiscoveryManager.DiscoveryListener mDiscoveryListener = new NsdDiscoveryManager.DiscoveryListener() {
@@ -133,12 +104,16 @@ public class ShareManager {
         @Override
         public void onPeerLost(String serviceName, String serviceType) {
             Log.d(TAG, "NSD Peer Lost: " + serviceName + " [" + serviceType + "]");
+            Peer lostPeer = peerMap.getOrDefault(serviceName, mRootPeer);
+            if (lostPeer != null && lostPeer.isConnected()) {
+                lostPeer.disconnect();
+                replaceLeechingPeer(lostPeer);
+            }
             peerMap.remove(serviceName);
-            // TODO: Find other peer to replace
         }
     };
 
-    private final SeekManager.LeechEventListener mLeechEventListener = new SeekManager.LeechEventListener() {
+    private final SeekManager.SeekEventListener mSeekEventListener = new SeekManager.SeekEventListener() {
         @Override
         public void onMetadataReady(InformationMetadata metadata) {
             startSharing(DiscoveryRole.SEEDER);
@@ -150,23 +125,82 @@ public class ShareManager {
         }
 
         @Override
+        public void onLeechingPeerStopped(Peer peer) {
+            replaceLeechingPeer(peer);
+        }
+
+        @Override
         public void onLeechingCompleted() {
-            // onDownloadFinished();
+            Log.d(TAG, "Leeching completed. Stopping seek now; seed stops in "
+                    + (STOP_SEED_DELAY_MS / 1000) + "s.");
+            stopSeek();
+            // Stay online briefly so other peers can keep leeching chunks from us.
+            mMainHandler.postDelayed(mStopSeedRunnable, STOP_SEED_DELAY_MS);
         }
     };
+
+    private void replaceLeechingPeer(Peer stoppedPeer) {
+        if (mSeekManager == null) {
+            return;
+        }
+
+        // Prefer a different peer from the discovered set as the replacement.
+        Peer replacementPeer = null;
+        for (Peer candidate : peerMap.values()) {
+            if (candidate.serviceName.equals(stoppedPeer.serviceName)
+                || candidate.isConnected()) {
+                continue;
+            }
+            replacementPeer = candidate;
+            break;
+        }
+        
+        if (replacementPeer != null) {
+            mSeekManager.startLeeching(replacementPeer);
+            Log.d(TAG, "Replaced stopped peer " + stoppedPeer + " with " + replacementPeer);
+            return;
+        }
+
+        Log.w(TAG, "Could not start leeching from any peer to replace " + stoppedPeer);
+    }
+
+    public void addPeersTrackingListener(SeedManager.PeersTrackingListener listener) {
+        if (listener == null) {
+            Log.w(TAG, "Attempted to add null PeersTrackingListener. Ignored.");
+            return;
+        }
+        mSeedManager.addPeersTrackingListener(listener);
+    }
+
+    public void removePeersTrackingListener(SeedManager.PeersTrackingListener listener) {
+        if (listener == null) {
+            Log.w(TAG, "Attempted to remove null PeersTrackingListener. Ignored.");
+            return;
+        }
+        mSeedManager.removePeersTrackingListener(listener);
+    }
+
+    public void addSeekEventListener(SeekManager.SeekEventListener listener) {
+        if (listener == null) {
+            Log.w(TAG, "Attempted to add null SeekEventListener. Ignored.");
+            return;
+        }
+        mSeekManager.addSeekListener(listener);
+    }
+    
+    public void removeSeekEventListener(SeekManager.SeekEventListener listener) {
+        if (listener == null) {
+            Log.w(TAG, "Attempted to remove null SeekEventListener. Ignored.");
+            return;
+        }
+        mSeekManager.removeSeekListener(listener);
+    }
 
     public ShareManager(Context context, File file, DiscoveryMode mode) {
         this.mContext = context;
         this.mFileShared = file;
         this.mDiscoveryMode = mode;
-    }
-
-    public void addShareListener(ShareListener listener) {
-        if (listener == null) {
-            Log.w(TAG, "Attempted to add null ShareListener. Ignored.");
-            return;
-        }
-        this.mShareListeners.add(listener);
+        this.mDeviceId = getUniqueId();
     }
 
     public void trackSharing() {
@@ -174,7 +208,7 @@ public class ShareManager {
         switch (mDiscoveryMode) {
             case NSD: {
                 nsdManager.registerService(HTTP_PORT, NsdDiscoveryManager.SERVICE_TYPE_PROGRESS,
-                        NsdDiscoveryManager.SERVICE_NAME_PREFIX_PROGRESS, getUniqueId());
+                        NsdDiscoveryManager.SERVICE_NAME_PREFIX_PROGRESS, mDeviceId);
                 break;
             }
             case WIFI_DIRECT: {
@@ -216,28 +250,27 @@ public class ShareManager {
     }
 
     private boolean prepareSeedManager() {
-        if (mFileShared != null) {
-            InformationMetadata informationMetadata = SecureManager.createFileMetadata(mFileShared,
+        boolean ownsWholeFile = mFileShared != null;
+
+        SharedData sharedData = SharedData.getInstance();
+        if (ownsWholeFile) {
+            InformationMetadata information = SecureManager.createFileMetadata(mFileShared,
                     SecureManager.CHUNK_SIZE_524KB);
-            if (informationMetadata == null) {
+            if (information == null) {
                 Log.e(TAG, "FileMetadata is null. Cannot prepare as seeder.");
                 return false;
             }
-            SharedData.getInstance().instanceInformationMetadata = informationMetadata;
+            sharedData.instanceInformationMetadata = information;
+            sharedData.instanceBitSetMetadata = new BitSetMetadata(information.getChunkHashes().length);
+            sharedData.instanceBitSetMetadata.setAllAvailable();
+        } else {
+            InformationMetadata information = sharedData.instanceInformationMetadata;
+            mFileShared = information.getFileShared();
         }
-
-        if (SharedData.getInstance().instanceInformationMetadata != null) {
-            mFileShared = SharedData.getInstance().instanceInformationMetadata.getFileShared();
-        }
-
-        InformationMetadata informationMetadata = SharedData.getInstance().instanceInformationMetadata;
-        BitSetMetadata bitSetMetadata = new BitSetMetadata(informationMetadata.getChunkHashes().length);
-        bitSetMetadata.setAllAvailable();
-        SharedData.getInstance().instanceBitSetMetadata = bitSetMetadata;
 
         StorageManager storageManager;
         try {
-            storageManager = new StorageManager(informationMetadata);
+            storageManager = new StorageManager(sharedData.instanceInformationMetadata);
         } catch (IllegalStateException e) {
             Log.e(TAG, "Failed to prepare SeedManager: " + e.getMessage());
             return false;
@@ -249,20 +282,17 @@ public class ShareManager {
 
     private boolean prepareSeekerManager() {
         mSeekManager = new SeekManager();
-        mSeekManager.setLeechEventListener(mLeechEventListener);
+        mSeekManager.addSeekListener(mSeekEventListener);
         return true;
     }
 
     private void reportProgressToRoot(int completed, int total) {
-        // int percent = total > 0 ? (int) ((completed * 100L) / total) : 0;
-
         if (mRootPeer == null) {
             return;
         }
-
         mHttpExecutor.submit(() -> {
             try {
-                HttpClient.reportProgress(mRootPeer.ip, mRootPeer.port, getUniqueId(), completed, total, 0);
+                HttpClient.reportProgress(mRootPeer.ip, mRootPeer.port, mDeviceId, completed, total);
             } catch (Exception e) {
                 Log.e(TAG, "Failed to report progress to Root: " + e.getMessage());
             }
@@ -272,15 +302,14 @@ public class ShareManager {
     private boolean prepareConnectionAsSeeder(DiscoveryMode mode) {
         switch (mode) {
             case NSD: {
-                if (nsdManager != null) {
-                    nsdManager.cleanUp();
-                    nsdManager = null;
+                if (nsdManager == null) {
+                    nsdManager = new NsdDiscoveryManager(mContext);
                 }
-                nsdManager = new NsdDiscoveryManager(mContext);
                 nsdManager.registerService(HTTP_PORT,
                                             NsdDiscoveryManager.SERVICE_TYPE_SHARE,
                                             NsdDiscoveryManager.SERVICE_NAME_PREFIX_SHARE,
-                                            getUniqueId());
+                                            mDeviceId);
+                Log.d(TAG, "NSD Service registered for SEEDER with device ID: " + mDeviceId);
                 break;
             }
             case WIFI_DIRECT: {
@@ -301,11 +330,9 @@ public class ShareManager {
     private boolean prepareConnectionAsSeeker(DiscoveryMode mode) {
         switch (mode) {
             case NSD: {
-                if (nsdManager != null) {
-                    nsdManager.cleanUp();
-                    nsdManager = null;
+                if (nsdManager == null) {
+                    nsdManager = new NsdDiscoveryManager(mContext);
                 }
-                nsdManager = new NsdDiscoveryManager(mContext);
                 nsdManager.addDiscoveryListener(mDiscoveryListener);
                 nsdManager.startDiscovery(NsdDiscoveryManager.SERVICE_TYPE_SHARE);
                 nsdManager.startDiscovery(NsdDiscoveryManager.SERVICE_TYPE_PROGRESS);
@@ -333,23 +360,32 @@ public class ShareManager {
                 Settings.Secure.ANDROID_ID);
     }
 
+    /** Stops everything immediately (leeching and seeding). */
     public synchronized void stopSharing() {
-        discoveryMode = DiscoveryMode.NSD;
-        isSharingStarted = false;
-        isDownloadingFinished = true;
+        mMainHandler.removeCallbacks(mStopSeedRunnable);
+        stopSeek();
+        stopSeed();
+    }
 
+    /** Stops leeching (downloading) from other peers. */
+    public synchronized void stopSeek() {
         if (mSeekManager != null) {
             mSeekManager.stop();
         }
+        
+        if (mHttpExecutor != null) {
+            mHttpExecutor.shutdownNow();
+            mHttpExecutor = Executors.newFixedThreadPool(MAX_PEER_CONNECTIONS);
+        }
+    }
+
+    /** Stops seeding (serving chunks) and tears down discovery / networking. */
+    public synchronized void stopSeed() {
         if (mSeedManager != null) {
             mSeedManager.stop();
             mSeedManager = null;
         }
 
-        if (mHttpExecutor != null) {
-            mHttpExecutor.shutdownNow();
-            mHttpExecutor = Executors.newFixedThreadPool(MAX_PEER_CONNECTIONS);
-        }
         if (mSeedingExecutor != null) {
             mSeedingExecutor.shutdownNow();
             mSeedingExecutor = Executors.newFixedThreadPool(MAX_PEER_CONNECTIONS);
@@ -369,10 +405,5 @@ public class ShareManager {
             httpServer.stop();
             httpServer = null;
         }
-
-        if (mStorageManager != null) {
-            mStorageManager.close();
-        }
-        // updateStatus("All background modules disabled.");
     }
 }

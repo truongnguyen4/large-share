@@ -12,6 +12,11 @@ import java.io.File;
 import java.io.Serializable;
 
 public class InformationMetadata implements Serializable {
+    private final static String FILE_SHARED_KEY = "fileShared";
+    private final static String FILE_SIZE_KEY = "fileSize";
+    private final static String FILE_HASH_KEY = "fileHash";
+    private final static String CHUNK_SIZE_KEY = "chunkSize";
+    private final static String CHUNK_HASHES_KEY = "chunkHashes";
     private final File fileShared; // File object representing the shared file
     private final long fileSize; // Size of the file in bytes
     private final String fileHash; // SHA-256 for the entire file
@@ -30,13 +35,13 @@ public class InformationMetadata implements Serializable {
 
     public static InformationMetadata fromJsonString(String jsonString) throws JSONException {
         JSONObject json = new JSONObject(jsonString);
-        File fileShared = new File(json.getString("fileShared"));
-        long fileSize = json.getLong("fileSize");
-        String fileHash = json.optString("fileHash", "");
-        int chunkSize = json.getInt("chunkSize");
+        File fileShared = new File(json.getString(FILE_SHARED_KEY));
+        long fileSize = json.getLong(FILE_SIZE_KEY);
+        String fileHash = json.optString(FILE_HASH_KEY, "");
+        int chunkSize = json.getInt(CHUNK_SIZE_KEY);
         String[] chunkHashes;
         {
-            JSONArray array = json.getJSONArray("chunkHashes");
+            JSONArray array = json.getJSONArray(CHUNK_HASHES_KEY);
             chunkHashes = new String[array.length()];
             for (int i = 0; i < array.length(); i++) {
                 chunkHashes[i] = array.getString(i);
@@ -57,11 +62,11 @@ public class InformationMetadata implements Serializable {
                 chunkHashesArray.put(hash);
             }
         }
-        json.put("fileShared", informationMetadata.getFileShared().getAbsolutePath());
-        json.put("fileSize", informationMetadata.getFileSize());
-        json.put("fileHash", informationMetadata.getFileHash());
-        json.put("chunkSize", informationMetadata.getChunkSize());
-        json.put("chunkHashes", chunkHashesArray);
+        json.put(FILE_SHARED_KEY, informationMetadata.getFileShared().getAbsolutePath());
+        json.put(FILE_SIZE_KEY, informationMetadata.getFileSize());
+        json.put(FILE_HASH_KEY, informationMetadata.getFileHash());
+        json.put(CHUNK_SIZE_KEY, informationMetadata.getChunkSize());
+        json.put(CHUNK_HASHES_KEY, chunkHashesArray);
         return json.toString();
     }
 
@@ -92,11 +97,11 @@ public class InformationMetadata implements Serializable {
     @Override
     public String toString() {
         return "InformationMetadata{" +
-                "fileShared=" + fileShared +
-                ", fileSize=" + fileSize +
-                ", fileHash='" + fileHash + '\'' +
-                ", chunkSize=" + chunkSize +
-                ", chunkHashes=" + (chunkHashes != null ? String.join(", ", chunkHashes) : "null") +
-                '}';
+                FILE_SHARED_KEY + "=" + fileShared + ", " + 
+                FILE_SIZE_KEY + "=" + fileSize + ", " + 
+                FILE_HASH_KEY + "='" + fileHash + '\'' + ", " + 
+                CHUNK_SIZE_KEY + "=" + chunkSize + ", " + 
+                CHUNK_HASHES_KEY + "=" + (chunkHashes != null ? String.join(", ", chunkHashes) : "null") +
+            '}';
     }
 }

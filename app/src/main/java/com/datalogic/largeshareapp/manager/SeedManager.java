@@ -1,6 +1,7 @@
 package com.datalogic.largeshareapp.manager;
-
 import android.util.Log;
+
+import java.util.Set;
 
 import com.datalogic.largeshareapp.model.BitSetMetadata;
 import com.datalogic.largeshareapp.model.InformationMetadata;
@@ -12,45 +13,19 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.IOException;
+import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
 public class SeedManager {
     private static final String TAG = "SeedManager";
-    private final int mPortConnection = 8888;
     private HttpServer mHttpServer;
     private StorageManager mStorageManager;
+    private final int mPortConnection = 8888;
+    private final Set<PeersTrackingListener> mPeersTrackingListeners = new CopyOnWriteArraySet<>();
 
-    public SeedManager(StorageManager storageManager) {
-        this.mStorageManager = storageManager;
-    }
-
-    public boolean initialize() {
-        mHttpServer = new HttpServer(mPortConnection);
-        try {
-            InformationMetadata metadata = SharedData.getInstance().instanceInformationMetadata;
-            mHttpServer.start(metadata,
-                                mGetMetadataResponseCallback,
-                                mGetBitsetResponseCallback,
-                                mGetChunkResponseCallback,
-                                mPostProgressResponseCallback);
-        } catch (IOException e) {
-            Log.e(TAG, "Failed to start HTTP server: " + e.getMessage());
-            return false;
-        }
-        return true;
-    }
-
-    /** Stops serving chunks and releases the underlying HTTP server. */
-    public void stop() {
-        if (mHttpServer != null) {
-            mHttpServer.stop();
-            mHttpServer = null;
-        }
-    }
-
-    private Supplier<byte[]> mGetMetadataResponseCallback = () -> {
+    private final Supplier<byte[]> mGetMetadataResponseCallback = () -> {
         try {
             InformationMetadata metadata = SharedData.getInstance().instanceInformationMetadata;
             if (metadata == null) {
@@ -63,22 +38,18 @@ public class SeedManager {
         }
     };
 
-    private Supplier<byte[]> mGetBitsetResponseCallback = () -> {
+    private final Supplier<byte[]> mGetBitsetResponseCallback = () -> {
         try {
             BitSetMetadata bitSetMetadata = SharedData.getInstance().instanceBitSetMetadata;
-            if (bitSetMetadata == null) {
-                return new byte[0];
-            }
-            String bitSetJson = BitSetMetadata.toJsonString(bitSetMetadata);
-            return bitSetJson.getBytes();
+            return BitSetMetadata.toJsonString(bitSetMetadata).getBytes();
         } catch (JSONException e) {
-            return new byte[0];
+            Log.e(TAG, "Failed to serialize bitset", e);
+            return "{}".getBytes();
         }
     };
 
-    private Function<Integer, byte[]> mGetChunkResponseCallback = (chunkIndex) -> {
+    private final Function<Integer, byte[]> mGetChunkResponseCallback = (chunkIndex) -> {
         try {
-            PerformanceTracker.startRecord("responseChunk" + chunkIndex, System.currentTimeMillis());
             byte[] chunkData = mStorageManager.readChunk(chunkIndex);
             if (chunkData == null) {
                 Log.e(TAG, "Chunk data is null for index: " + chunkIndex);
@@ -92,23 +63,72 @@ public class SeedManager {
         }
     };
 
-    private Consumer<String> mPostProgressResponseCallback = (body) -> {
+    private final Consumer<String> mPostProgressResponseCallback = (body) -> {
         try {
-            // Parse the JSON body to extract progress information
             JSONObject json = new JSONObject(body);
             String deviceId = json.getString("deviceId");
             int completed = json.getInt("completed");
             int total = json.getInt("total");
-            int failures = json.getInt("failures");
 
-            // Handle the progress report (e.g., update UI, log, etc.)
-            Log.i(TAG, "Progress report received from device: " + deviceId +
-                    ", completed: " + completed + ", total: " + total + ", failures: " + failures);
-
-            // You can add additional logic here to handle the progress report as needed
-
+            notifyToPeersTrackingListener(listener -> listener.onProgressUpdated(deviceId, completed, total));
         } catch (JSONException e) {
             Log.e(TAG, "Malformed progress payload: " + body, e);
         }
     };
+
+    public SeedManager(StorageManager storageManager) {
+        this.mStorageManager = storageManager;
+    }
+
+    public boolean initialize() {
+        mHttpServer = new HttpServer(mPortConnection);
+        try {
+            mHttpServer.start(mGetMetadataResponseCallback,
+                                mGetBitsetResponseCallback,
+                                mGetChunkResponseCallback,
+                                mPostProgressResponseCallback);
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to start HTTP server: " + e.getMessage());
+            return false;
+        }
+        return true;
+    }
+
+    public void stop() {
+        if (mHttpServer != null) {
+            mHttpServer.stop();
+            mHttpServer = null;
+        }
+    }
+
+    public interface PeersTrackingListener {
+        void onProgressUpdated(String deviceId, int completed, int total);
+    }
+
+    public void addPeersTrackingListener(PeersTrackingListener listener) {
+        if (listener == null) {
+            Log.w(TAG, "ProgressListener is null");
+            return;
+        }
+        this.mPeersTrackingListeners.add(listener);
+    }
+
+    public void removePeersTrackingListener(PeersTrackingListener listener) {
+        if (listener == null) {
+            Log.w(TAG, "ProgressListener is null");
+            return;
+        }
+        this.mPeersTrackingListeners.remove(listener);
+    }
+
+    private interface PeersTrackingListenerConsumer {
+        void accept(PeersTrackingListener listener);
+    }
+
+    private void notifyToPeersTrackingListener(PeersTrackingListenerConsumer consumer) {
+        Set<PeersTrackingListener> listeners = new CopyOnWriteArraySet<>(mPeersTrackingListeners);
+        for (PeersTrackingListener listener : listeners) {
+            consumer.accept(listener);
+        }
+    }
 }

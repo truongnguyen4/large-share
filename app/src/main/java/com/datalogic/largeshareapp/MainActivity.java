@@ -3,34 +3,53 @@ package com.datalogic.largeshareapp;
 import android.Manifest;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.Settings;
+import android.text.Editable;
+import android.text.TextWatcher;
 import android.util.Log;
 import android.view.View;
+import android.widget.ArrayAdapter;
+import android.widget.AutoCompleteTextView;
 import android.widget.Button;
 import android.widget.ProgressBar;
-import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
+import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.cardview.widget.CardView;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
+import androidx.recyclerview.widget.LinearLayoutManager;
+import androidx.recyclerview.widget.RecyclerView;
 
 import com.datalogic.largeshareapp.manager.SecureManager;
+import com.datalogic.largeshareapp.manager.SeedManager;
+import com.datalogic.largeshareapp.manager.SeekManager;
 import com.datalogic.largeshareapp.manager.ShareManager;
 import com.datalogic.largeshareapp.model.InformationMetadata;
+import com.datalogic.largeshareapp.ui.PeerFilterAdapter;
+import com.datalogic.largeshareapp.ui.PeerProgressAdapter;
 
 import java.io.File;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -41,30 +60,71 @@ public class MainActivity extends AppCompatActivity {
     private final AtomicBoolean mIsSharing = new AtomicBoolean(false);
     private ShareManager.DiscoveryMode mDiscoveryMode = ShareManager.DiscoveryMode.NSD;
     private ShareManager.DiscoveryRole mDiscoveryRole = ShareManager.DiscoveryRole.SEEKER;
-
+    private final Handler mHandler = new Handler(Looper.getMainLooper());
     // UI Widgets
     private RadioGroup rgDiscovery;
     private RadioGroup rgRole;
-    private RadioButton rbNsd;
-    private RadioButton rbWifiDirect;
-    private RadioButton rbRoot;
-    private RadioButton rbSeeker;
-    
     private Button btnAction;
-    private Button btnRetry;
-    
-    private TextView tvNodeId;
-    private TextView tvProgressText;
-    private ProgressBar pbDownload;
-    private TextView tvFailureText;
-    private TextView tvPeersList;
-    private TextView tvLogs;
+    // Seeker's own download progress (visible only in Seeker role)
+    private CardView cvSeekerProgress;
+    private ProgressBar pbSeeker;
+    private TextView tvSeekerPercent;
+    private TextView tvSeekerProgress;
 
-    // Custom File Picker Widgets & Fields
+    // Peer progress tracker
+    private RecyclerView rvPeers;
+    private TextView tvPeersSummary;
+    private TextView tvPeersEmpty;
+    private TextView tvCompletionInfo;
+    private final PeerProgressAdapter peersAdapter = new PeerProgressAdapter();
+
+    // Peer search / filter
+    private CardView cvPeers;
+    private Button btnPeerFilter;
+    private TextView tvPeerFilterStatus;
+    private TextView tvPeerFilterClear;
+    private ArrayAdapter<String> peerSearchAdapter;
+    private final Set<String> mPeerFilter = new HashSet<>();
+    private Map<String, ShareManager.PeerProgress> mLastProgressMap = Collections.emptyMap();
+    private final Map<String, ShareManager.PeerProgress> mPeerProgressMap = new HashMap<>();
     private View llFilePickerContainer;
     private Button btnSelectFile;
     private TextView tvSelectedFileInfo;
     private TextView tvMetadataDetails;
+    // Collapsible file-details card
+    private View llFileCardHeader;
+    private TextView tvFileCardToggle;
+    private View nsvMetadataDetails;
+    private boolean mFileDetailsExpanded = false;
+
+    // Seeder view: progress reported by other (leeching) peers.
+    private final SeedManager.PeersTrackingListener mPeersTrackingListener = new SeedManager.PeersTrackingListener() {
+        @Override
+        public void onProgressUpdated(String deviceId, int completed, int total) {
+            renderPeerTracker(deviceId, completed, total);
+        }
+    };
+
+    // Seeker view: this device's own leeching progress.
+    private final SeekManager.SeekEventListener mSeekEventListener = new SeekManager.SeekEventListener() {
+        @Override
+        public void onChunkBatchLeeched(int completed, int total) {
+            renderSeekProgress(completed, total);
+        }
+
+        @Override
+        public void onLeechingCompleted() {
+            runOnUiThread(() -> {
+                tvCompletionInfo.setText("Download completed. Staying in the share session for a while to help other peers.");
+                tvCompletionInfo.setVisibility(View.VISIBLE);
+            });
+            mHandler.postDelayed(() -> {
+                tvCompletionInfo.setText("Left the share session. Get out network");
+                tvCompletionInfo.setVisibility(View.VISIBLE);
+                btnAction.setText("Start sharing");
+            }, ShareManager.STOP_SEED_DELAY_MS);
+        }
+    };
 
     private final ActivityResultLauncher<String> filePickerLauncher =
         registerForActivityResult(new ActivityResultContracts.GetContent(), uri -> {
@@ -73,58 +133,7 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
-
     private ShareManager shareManager;
-    ShareManager.ShareListener mShareListener = new ShareManager.ShareListener() {
-        @Override
-        public void onStatusUpdated(String status) {
-            Log.d(TAG, status);
-        }
-        @Override
-        public void onProgressUpdated(int completed, int total, int failures) {
-            pbDownload.setMax(total);
-            pbDownload.setProgress(completed);
-
-            double pct = total > 0 ? ((double) completed / total) * 100.0 : 0.0;
-            tvProgressText.setText(String.format(Locale.getDefault(), "Chunks: %d / %d (%.2f%%)", completed, total, pct));
-
-        }
-
-        @Override
-        public void onPeerProgressUpdated(Map<String, ShareManager.PeerProgress> progressMap) {
-            StringBuilder sb = new StringBuilder();
-            if (progressMap.isEmpty()) {
-                sb.append("No active peer details reported yet.");
-            } else {
-                for (Map.Entry<String, ShareManager.PeerProgress> entry : progressMap.entrySet()) {
-                    String activeNodeId = entry.getKey();
-                    ShareManager.PeerProgress p = entry.getValue();
-                    double pct = p.total > 0 ? ((double) p.completed / p.total) * 100.0 : 0.0;
-                    sb.append(String.format(Locale.getDefault(), "• Node[%s] IP: %s -> Chunks: %d/%d (%.1f%%), Failures: %d\n",
-                            activeNodeId, p.ip, p.completed, p.total, p.failures, p.failures));
-                }
-            }
-            tvPeersList.setText(sb.toString());
-        }
-
-        @Override
-        public void onDownloadCompleted(boolean success) {
-            if (success) {
-                btnRetry.setEnabled(false);
-            } else {
-                btnRetry.setEnabled(true);
-            }
-        }
-
-        @Override
-        public void onServiceStopped() {
-            Log.d(TAG, "P2P Lifecycle Finished. Re-enabling controls.");
-            btnAction.setText(rgRole.getCheckedRadioButtonId() == R.id.rb_root ? "Share data" : "Seek Data");
-            btnRetry.setEnabled(false);
-            toggleFreezeUI(true);
-            shareManager = null;
-        }
-    };
     private File mFileShared;
 
     @Override
@@ -135,26 +144,44 @@ public class MainActivity extends AppCompatActivity {
         // Map widgets
         rgDiscovery = findViewById(R.id.rg_discovery);
         rgRole = findViewById(R.id.rg_role);
-        rbNsd = findViewById(R.id.rb_nsd);
-        rbWifiDirect = findViewById(R.id.rb_wifidirect);
-        rbRoot = findViewById(R.id.rb_root);
-        rbSeeker = findViewById(R.id.rb_seeker);
-        
+
         btnAction = findViewById(R.id.btn_distribute);
-        btnRetry = findViewById(R.id.btn_retry);
-        
-        tvNodeId = findViewById(R.id.tv_node_id);
-        tvProgressText = findViewById(R.id.tv_progress_text);
-        pbDownload = findViewById(R.id.pb_download);
-        tvFailureText = findViewById(R.id.tv_failure_text);
-        tvPeersList = findViewById(R.id.tv_peers_list);
-        tvLogs = findViewById(R.id.tv_logs);
+
+        // Seeker's own download progress card.
+        cvSeekerProgress = findViewById(R.id.cv_seeker_progress);
+        pbSeeker = findViewById(R.id.pb_seeker);
+        tvSeekerPercent = findViewById(R.id.tv_seeker_percent);
+        tvSeekerProgress = findViewById(R.id.tv_seeker_progress);
+
+        // Peer progress tracker: a scannable list rather than a wall of text.
+        tvPeersSummary = findViewById(R.id.tv_peers_summary);
+        tvPeersEmpty = findViewById(R.id.tv_peers_empty);
+        tvCompletionInfo = findViewById(R.id.tv_completion_info);
+        rvPeers = findViewById(R.id.rv_peers);
+        rvPeers.setLayoutManager(new LinearLayoutManager(this));
+        rvPeers.setAdapter(peersAdapter);
+        cvPeers = findViewById(R.id.cv_peers);
+        btnPeerFilter = findViewById(R.id.btn_peer_filter);
+        tvPeerFilterStatus = findViewById(R.id.tv_peer_filter_status);
+        tvPeerFilterClear = findViewById(R.id.tv_peer_filter_clear);
+
+        peerSearchAdapter = new ArrayAdapter<>(this, android.R.layout.simple_dropdown_item_1line);
+
+        btnPeerFilter.setOnClickListener(v -> openPeerFilterDialog(null));
+        tvPeerFilterClear.setOnClickListener(v -> clearPeerFilter());
 
         // Map File Picker widgets
         btnSelectFile = findViewById(R.id.btn_select_file);
         tvSelectedFileInfo = findViewById(R.id.tv_selected_file_info);
         tvMetadataDetails = findViewById(R.id.tv_metadata_details);
         llFilePickerContainer = findViewById(R.id.ll_file_picker_container);
+
+        // Collapsible file-details card: tap the header to expand/collapse the metadata.
+        llFileCardHeader = findViewById(R.id.ll_file_card_header);
+        tvFileCardToggle = findViewById(R.id.tv_file_card_toggle);
+        nsvMetadataDetails = findViewById(R.id.nsv_metadata_details);
+        llFileCardHeader.setOnClickListener(v -> setFileDetailsExpanded(!mFileDetailsExpanded));
+        setFileDetailsExpanded(false);
 
         initialize();
         checkAndRequestPermissions();
@@ -174,10 +201,14 @@ public class MainActivity extends AppCompatActivity {
                 btnAction.setText("Share data");
                 llFilePickerContainer.setVisibility(View.VISIBLE);
                 mDiscoveryRole = ShareManager.DiscoveryRole.SEEDER;
+                cvPeers.setVisibility(View.VISIBLE);
+                cvSeekerProgress.setVisibility(View.GONE);
             } else {
                 btnAction.setText("Seek Data");
                 llFilePickerContainer.setVisibility(View.GONE);
                 mDiscoveryRole = ShareManager.DiscoveryRole.SEEKER;
+                cvPeers.setVisibility(View.GONE);
+                cvSeekerProgress.setVisibility(View.VISIBLE);
             }
         });
 
@@ -209,7 +240,6 @@ public class MainActivity extends AppCompatActivity {
         }
         btnSelectFile.setEnabled(enabled);
     }
-
 
     private void parseFileSelection(Uri uri) {
         mFileShared = new File("/sdcard/file-shared.zip");
@@ -251,7 +281,179 @@ public class MainActivity extends AppCompatActivity {
         shareManager.startSharing(mDiscoveryRole);
         if (mDiscoveryRole == ShareManager.DiscoveryRole.SEEDER) {
             shareManager.trackSharing();
+            shareManager.addPeersTrackingListener(mPeersTrackingListener);
         }
+        if (mDiscoveryRole == ShareManager.DiscoveryRole.SEEKER) {
+            shareManager.addSeekEventListener(mSeekEventListener);
+        }
+    }
+
+    private void renderSeekProgress(int completed, int total) {
+        runOnUiThread(() -> {
+            int percent = total > 0 ? (int) Math.round((completed * 100.0) / total) : 0;
+            pbSeeker.setMax(100);
+            pbSeeker.setProgress(percent);
+            tvSeekerPercent.setText(String.format(Locale.getDefault(), "%d%%", percent));
+            tvSeekerProgress.setText(String.format(Locale.getDefault(),
+                    "Chunks: %d / %d downloaded", completed, total));
+        });
+    }
+
+    private void renderPeerTracker(String deviceId, int completed, int total) {
+        runOnUiThread(() -> {
+            mPeerProgressMap.put(deviceId,
+                    new ShareManager.PeerProgress("deviceId", completed, total, deviceId));
+            renderPeerProgress(mPeerProgressMap);
+        });
+    }
+
+    private void renderPeerProgress(Map<String, ShareManager.PeerProgress> progressMap) {
+        mLastProgressMap = progressMap;
+        refreshPeerSuggestions(progressMap);
+        updateFilterStatus();
+
+        Map<String, ShareManager.PeerProgress> display = applyPeerFilter(progressMap);
+
+        if (display.isEmpty()) {
+            rvPeers.setVisibility(View.GONE);
+            tvPeersEmpty.setVisibility(View.VISIBLE);
+            tvPeersEmpty.setText(progressMap.isEmpty()
+                    ? "No peers connected yet."
+                    : "No peers match the current filter.");
+            tvPeersSummary.setText(mPeerFilter.isEmpty()
+                    ? "0 peers"
+                    : String.format(Locale.getDefault(), "0 of %d peers", progressMap.size()));
+            peersAdapter.submit(display);
+            return;
+        }
+
+        tvPeersEmpty.setVisibility(View.GONE);
+        rvPeers.setVisibility(View.VISIBLE);
+
+        int shown = display.size();
+        int completedPeers = 0;
+        double pctSum = 0.0;
+        for (ShareManager.PeerProgress p : display.values()) {
+            double pct = p.total > 0 ? ((double) p.completed / p.total) * 100.0 : 0.0;
+            pctSum += pct;
+            if (p.total > 0 && p.completed >= p.total) {
+                completedPeers++;
+            }
+        }
+        double avgPct = shown > 0 ? pctSum / shown : 0.0;
+        if (mPeerFilter.isEmpty()) {
+            tvPeersSummary.setText(String.format(Locale.getDefault(),
+                    "%d peers • %d done • avg %.0f%%", shown, completedPeers, avgPct));
+        } else {
+            tvPeersSummary.setText(String.format(Locale.getDefault(),
+                    "%d of %d peers • avg %.0f%%", shown, progressMap.size(), avgPct));
+        }
+
+        peersAdapter.submit(display);
+    }
+
+    /** Restricts the map to the ticked peer ids; an empty filter means "show all". */
+    private Map<String, ShareManager.PeerProgress> applyPeerFilter(
+            Map<String, ShareManager.PeerProgress> src) {
+        if (mPeerFilter.isEmpty()) {
+            return src;
+        }
+        Map<String, ShareManager.PeerProgress> out = new HashMap<>();
+        for (Map.Entry<String, ShareManager.PeerProgress> entry : src.entrySet()) {
+            if (mPeerFilter.contains(entry.getKey())) {
+                out.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return out;
+    }
+
+    /** Keeps the search bar's autocomplete suggestions in sync with known peers. */
+    private void refreshPeerSuggestions(Map<String, ShareManager.PeerProgress> progressMap) {
+        peerSearchAdapter.clear();
+        peerSearchAdapter.addAll(progressMap.keySet());
+        peerSearchAdapter.notifyDataSetChanged();
+    }
+
+    private void updateFilterStatus() {
+        if (mPeerFilter.isEmpty()) {
+            tvPeerFilterStatus.setText("Showing all peers");
+            tvPeerFilterClear.setVisibility(View.GONE);
+        } else {
+            tvPeerFilterStatus.setText(String.format(Locale.getDefault(),
+                    "Filter active: %d peer(s) selected", mPeerFilter.size()));
+            tvPeerFilterClear.setVisibility(View.VISIBLE);
+        }
+    }
+
+    private void clearPeerFilter() {
+        mPeerFilter.clear();
+        renderPeerProgress(mLastProgressMap);
+    }
+
+    private void openPeerFilterDialog(String initialQuery) {
+        final Map<String, ShareManager.PeerProgress> peers = mLastProgressMap;
+        if (peers.isEmpty()) {
+            Toast.makeText(this, "No peers to filter yet.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        List<PeerFilterAdapter.Item> items = new ArrayList<>();
+        for (Map.Entry<String, ShareManager.PeerProgress> entry : peers.entrySet()) {
+            ShareManager.PeerProgress p = entry.getValue();
+            int percent = p.total > 0 ? (int) Math.round((p.completed * 100.0) / p.total) : 0;
+            items.add(new PeerFilterAdapter.Item(
+                    entry.getKey(), "Peer " + PeerProgressAdapter.shortId(entry.getKey()), percent));
+        }
+
+        // Pre-tick the active filter, or everything when no filter is set yet.
+        Set<String> initiallyChecked = mPeerFilter.isEmpty()
+                ? new HashSet<>(peers.keySet())
+                : new HashSet<>(mPeerFilter);
+
+        View dialogView = getLayoutInflater().inflate(R.layout.dialog_peer_filter, null);
+        AutoCompleteTextView search = dialogView.findViewById(R.id.actv_dialog_search);
+        RecyclerView rv = dialogView.findViewById(R.id.rv_dialog_peers);
+        TextView empty = dialogView.findViewById(R.id.tv_dialog_empty);
+
+        PeerFilterAdapter adapter = new PeerFilterAdapter(items, initiallyChecked);
+        rv.setLayoutManager(new LinearLayoutManager(this));
+        rv.setAdapter(adapter);
+
+        // Autocomplete suggestions + live filtering of the tick list as the user types.
+        search.setAdapter(new ArrayAdapter<>(this,
+                android.R.layout.simple_dropdown_item_1line, new ArrayList<>(peers.keySet())));
+        search.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int st, int c, int a) { }
+            @Override public void onTextChanged(CharSequence s, int st, int b, int c) {
+                adapter.filter(s.toString());
+                empty.setVisibility(adapter.isEmptyVisible() ? View.VISIBLE : View.GONE);
+            }
+            @Override public void afterTextChanged(Editable s) { }
+        });
+
+        if (initialQuery != null && !initialQuery.isEmpty()) {
+            search.setText(initialQuery);
+            adapter.filter(initialQuery);
+            empty.setVisibility(adapter.isEmptyVisible() ? View.VISIBLE : View.GONE);
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle("Select peers to display")
+                .setView(dialogView)
+                .setPositiveButton("Confirm", (d, which) ->
+                        applyTickedSelection(adapter.getSelectedIds(), peers.size()))
+                .setNeutralButton("Show all", (d, which) -> clearPeerFilter())
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void applyTickedSelection(Set<String> selected, int totalKnown) {
+        mPeerFilter.clear();
+        // A full (or empty) selection means "no filter" — show everything.
+        if (!selected.isEmpty() && selected.size() < totalKnown) {
+            mPeerFilter.addAll(selected);
+        }
+        renderPeerProgress(mLastProgressMap);
     }
 
     private void showMetadataInfo(InformationMetadata meta) {
@@ -269,6 +471,15 @@ public class MainActivity extends AppCompatActivity {
             sb.append(String.format(Locale.getDefault(), "Chunk %d: \n%s\n", i, hashes[i]));
         }
         tvMetadataDetails.setText(sb.toString());
+        // Reveal the freshly compiled metadata.
+        setFileDetailsExpanded(true);
+    }
+
+    /** Expands or collapses the metadata body of the selected-file card. */
+    private void setFileDetailsExpanded(boolean expanded) {
+        mFileDetailsExpanded = expanded;
+        nsvMetadataDetails.setVisibility(expanded ? View.VISIBLE : View.GONE);
+        tvFileCardToggle.setText(expanded ? "▾" : "▸");
     }
 
     private void checkAndRequestPermissions() {

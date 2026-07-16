@@ -141,50 +141,79 @@
                         android:textColor="#555555"
                         android:layout_marginBottom="4dp"/>
 
-                    <LinearLayout
+                    <Button
+                        android:id="@+id/btn_select_file"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Select File"
+                        android:backgroundTint="#00897B"
+                        android:textColor="#FFFFFF"
+                        android:layout_marginBottom="8dp"/>
+
+                    <!-- Collapsible card: header shows the selected file, body shows metadata -->
+                    <androidx.cardview.widget.CardView
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:orientation="horizontal"
-                        android:gravity="center_vertical">
+                        app:cardCornerRadius="6dp"
+                        app:cardElevation="2dp"
+                        app:cardBackgroundColor="#F5F5F5">
 
-                        <Button
-                            android:id="@+id/btn_select_file"
-                            style="?android:attr/buttonStyleSmall"
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:text="Select File"
-                            android:backgroundTint="#00897B"
-                            android:textColor="#FFFFFF"
-                            android:layout_marginEnd="8dp"/>
-
-                        <TextView
-                            android:id="@+id/tv_selected_file_info"
-                            android:layout_width="0dp"
-                            android:layout_height="wrap_content"
-                            android:layout_weight="1"
-                            android:text="Selected file: None"
-                            android:textSize="12sp"
-                            android:textColor="#424242"
-                            android:textStyle="italic"/>
-                    </LinearLayout>
-
-                    <androidx.core.widget.NestedScrollView
-                        android:layout_width="match_parent"
-                        android:layout_height="150dp"
-                        android:layout_marginTop="8dp"
-                        android:background="#F5F5F5">
-
-                        <TextView
-                            android:id="@+id/tv_metadata_details"
+                        <LinearLayout
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:padding="8dp"
-                            android:text="No metadata compiled yet. Select a file or use the default to split &amp; build the chunk SHA-256 table."
-                            android:textSize="11sp"
-                            android:textColor="#47525E"
-                            android:fontFamily="monospace"
-                            android:visibility="visible"/>
-                    </androidx.core.widget.NestedScrollView>
+                            android:orientation="vertical">
+
+                            <!-- Header: tap to expand/collapse the metadata body -->
+                            <LinearLayout
+                                android:id="@+id/ll_file_card_header"
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:orientation="horizontal"
+                                android:gravity="center_vertical"
+                                android:background="?android:attr/selectableItemBackground"
+                                android:padding="12dp">
+
+                                <TextView
+                                    android:id="@+id/tv_selected_file_info"
+                                    android:layout_width="0dp"
+                                    android:layout_height="wrap_content"
+                                    android:layout_weight="1"
+                                    android:text="Selected file: None"
+                                    android:textSize="12sp"
+                                    android:textColor="#424242"
+                                    android:textStyle="italic"/>
+
+                                <TextView
+                                    android:id="@+id/tv_file_card_toggle"
+                                    android:layout_width="wrap_content"
+                                    android:layout_height="wrap_content"
+                                    android:text="▸"
+                                    android:textSize="16sp"
+                                    android:textStyle="bold"
+                                    android:textColor="#1976D2"
+                                    android:paddingStart="8dp"/>
+                            </LinearLayout>
+
+                            <!-- Collapsible body: chunk / SHA-256 metadata -->
+                            <androidx.core.widget.NestedScrollView
+                                android:id="@+id/nsv_metadata_details"
+                                android:layout_width="match_parent"
+                                android:layout_height="150dp"
+                                android:background="#FFFFFF"
+                                android:visibility="gone">
+
+                                <TextView
+                                    android:id="@+id/tv_metadata_details"
+                                    android:layout_width="match_parent"
+                                    android:layout_height="wrap_content"
+                                    android:padding="8dp"
+                                    android:text="No metadata compiled yet. Select a file or use the default to split &amp; build the chunk SHA-256 table."
+                                    android:textSize="11sp"
+                                    android:textColor="#47525E"
+                                    android:fontFamily="monospace"/>
+                            </androidx.core.widget.NestedScrollView>
+                        </LinearLayout>
+                    </androidx.cardview.widget.CardView>
                 </LinearLayout>
 
             </LinearLayout>
@@ -207,25 +236,16 @@
                 android:textColor="#FFFFFF"
                 android:layout_marginEnd="8dp"/>
 
-            <Button
-                android:id="@+id/btn_retry"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="Retry Failures"
-                android:backgroundTint="#F44336"
-                android:textColor="#FFFFFF"
-                android:visibility="gone"
-                android:enabled="false"/>
-
         </LinearLayout>
 
-        <!-- Section 3: Local Node Progress -->
+        <!-- Section 3: My Download Progress (Seeker perspective) -->
         <androidx.cardview.widget.CardView
+            android:id="@+id/cv_seeker_progress"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginBottom="12dp"
             android:elevation="4dp"
+            android:visibility="gone"
             app:cardCornerRadius="8dp"
             app:cardBackgroundColor="#FFFFFF">
 
@@ -235,50 +255,48 @@
                 android:orientation="vertical"
                 android:padding="12dp">
 
-                <TextView
-                    android:layout_width="wrap_content"
+                <LinearLayout
+                    android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:text="2. Local Node Information"
-                    android:textStyle="bold"
-                    android:textSize="15sp"
-                    android:textColor="#1976D2"
-                    android:layout_marginBottom="8dp"/>
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginBottom="8dp">
 
-                <TextView
-                    android:id="@+id/tv_node_id"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Node ID: N/A"
-                    android:textSize="13sp"
-                    android:textColor="#333333"
-                    android:layout_marginBottom="4dp"/>
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="My Download Progress"
+                        android:textStyle="bold"
+                        android:textSize="15sp"
+                        android:textColor="#1976D2"/>
 
-                <TextView
-                    android:id="@+id/tv_progress_text"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Chunks: 0 / 0 (0.00%)"
-                    android:textSize="13sp"
-                    android:textColor="#333333"
-                    android:layout_marginBottom="6dp"/>
+                    <TextView
+                        android:id="@+id/tv_seeker_percent"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="0%"
+                        android:textSize="18sp"
+                        android:textStyle="bold"
+                        android:textColor="#1976D2"/>
+                </LinearLayout>
 
                 <ProgressBar
-                    android:id="@+id/pb_download"
+                    android:id="@+id/pb_seeker"
                     style="?android:attr/progressBarStyleHorizontal"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginBottom="8dp"
                     android:max="100"
-                    android:progress="0"/>
+                    android:progress="0"
+                    android:layout_marginBottom="6dp"/>
 
                 <TextView
-                    android:id="@+id/tv_failure_text"
+                    android:id="@+id/tv_seeker_progress"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:text="Failed Chunks Log: None"
-                    android:textColor="#D32F2F"
+                    android:text="Waiting to leech chunks…"
                     android:textSize="13sp"
-                    android:textStyle="italic"/>
+                    android:textColor="#333333"/>
 
             </LinearLayout>
         </androidx.cardview.widget.CardView>
@@ -290,6 +308,7 @@
             android:layout_height="wrap_content"
             android:layout_marginBottom="12dp"
             android:elevation="4dp"
+            android:visibility="gone"
             app:cardCornerRadius="8dp"
             app:cardBackgroundColor="#FFFFFF">
 
@@ -299,64 +318,114 @@
                 android:orientation="vertical"
                 android:padding="12dp">
 
-                <TextView
-                    android:layout_width="wrap_content"
+                <LinearLayout
+                    android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:text="3. Network Peers Progress Tracker"
-                    android:textStyle="bold"
-                    android:textSize="15sp"
-                    android:textColor="#1976D2"
-                    android:layout_marginBottom="8dp"/>
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginBottom="8dp">
+
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="2. Network Peers Progress Tracker"
+                        android:textStyle="bold"
+                        android:textSize="15sp"
+                        android:textColor="#1976D2"/>
+
+                    <TextView
+                        android:id="@+id/tv_peers_summary"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="0 peers"
+                        android:textSize="12sp"
+                        android:textStyle="bold"
+                        android:textColor="#00897B"/>
+                </LinearLayout>
+
+                <!-- Peer filter: autocomplete search + tick-to-select dialog -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginBottom="4dp">
+
+
+
+                    <Button
+                        android:id="@+id/btn_peer_filter"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Select"
+                        android:backgroundTint="#00897B"
+                        android:textColor="#FFFFFF"/>
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginBottom="4dp">
+
+                    <TextView
+                        android:id="@+id/tv_peer_filter_status"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="Showing all peers"
+                        android:textSize="11sp"
+                        android:textStyle="italic"
+                        android:textColor="#00897B"/>
+
+                    <TextView
+                        android:id="@+id/tv_peer_filter_clear"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Show all ✕"
+                        android:textSize="11sp"
+                        android:textStyle="bold"
+                        android:textColor="#D32F2F"
+                        android:padding="4dp"
+                        android:visibility="gone"/>
+                </LinearLayout>
 
                 <TextView
-                    android:id="@+id/tv_peers_list"
+                    android:id="@+id/tv_peers_empty"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:text="No peers connected yet."
                     android:textSize="13sp"
-                    android:textColor="#333333"
-                    android:minLines="3"/>
+                    android:textColor="#999999"
+                    android:textStyle="italic"
+                    android:paddingTop="8dp"
+                    android:paddingBottom="8dp"/>
 
-            </LinearLayout>
-        </androidx.cardview.widget.CardView>
-
-        <!-- Section 5: Operation Logs -->
-        <androidx.cardview.widget.CardView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:elevation="4dp"
-            app:cardCornerRadius="8dp"
-            app:cardBackgroundColor="#FFFFFF">
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="vertical"
-                android:padding="12dp">
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="4. Operating System Status Log"
-                    android:textStyle="bold"
-                    android:textSize="15sp"
-                    android:textColor="#1976D2"
-                    android:layout_marginBottom="4dp"/>
-
-                <TextView
-                    android:id="@+id/tv_logs"
+                <androidx.recyclerview.widget.RecyclerView
+                    android:id="@+id/rv_peers"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:background="#ECEFF1"
-                    android:padding="8dp"
-                    android:scrollbars="vertical"
-                    android:text="Service offline\n"
-                    android:fontFamily="monospace"
-                    android:textSize="11sp"
-                    android:textColor="#37474F"/>
+                    android:nestedScrollingEnabled="false"
+                    android:overScrollMode="never"/>
 
             </LinearLayout>
         </androidx.cardview.widget.CardView>
+
+        <!-- Shown when this device finishes downloading. -->
+        <TextView
+            android:id="@+id/tv_completion_info"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:padding="12dp"
+            android:text="Download complete. Staying online briefly to keep sharing chunks with peers…"
+            android:textColor="#2E7D32"
+            android:textStyle="bold"
+            android:textSize="14sp"
+            android:gravity="center"
+            android:visibility="gone"/>
 
 </LinearLayout>
 </androidx.core.widget.NestedScrollView>

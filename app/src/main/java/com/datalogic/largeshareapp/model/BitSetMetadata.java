@@ -8,6 +8,7 @@ import org.json.JSONObject;
 import java.util.BitSet;
 
 public class BitSetMetadata {
+    public static final String AVAILABLE_CHUNKS_KEY = "availableChunks";
     private final BitSet availableChunks; // BitSet representing which chunks are available
     private final BitSet requestedChunks; // BitSet representing which chunks are requested
     private final int mSize; // Total number of chunks
@@ -62,7 +63,7 @@ public class BitSetMetadata {
         }
         JSONObject json = new JSONObject();
         String availableChunksStr = SecureManager.convertBitSetToString(bitSetMetadata.getAvailableChunks());
-        json.put("availableChunks", availableChunksStr);
+        json.put(AVAILABLE_CHUNKS_KEY, availableChunksStr);
         return json.toString();
     }
 }

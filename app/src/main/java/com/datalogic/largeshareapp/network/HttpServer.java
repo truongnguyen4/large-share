@@ -1,21 +1,17 @@
 package com.datalogic.largeshareapp.network;
 
-import android.os.Handler;
-import android.os.Looper;
 import android.util.Log;
-
-import com.datalogic.largeshareapp.model.InformationMetadata;
-
-import org.json.JSONObject;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.net.HttpURLConnection;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -26,62 +22,37 @@ import java.util.function.Supplier;
 public class HttpServer {
     private static final String TAG = "HttpServer";
 
-    public static final String GET = "GET";
-    public static final String POST = "POST";
-    public static final int RESPONSE_ERROR_UNSUPPORTED = 303;
-    public static final int RESPONSE_ERROR_TIMEOUT = 403;
-    public static final int RESPONSE_ERROR_REQUEST_CORRUPTED = 400;
-    public static final int RESPONSE_SUCCESS = 200;
-
     private final int EXECUTOR_CAPABILITY = 10;
-    private final int REQUEST_TIMEOUT = 5000;
     private final int mPort;
 
     private ServerSocket mServerSocket;
     private ExecutorService mServerExecutor = Executors.newFixedThreadPool(EXECUTOR_CAPABILITY);;
     private final AtomicBoolean mIsRunning = new AtomicBoolean(false);
 
-    private InformationMetadata mMetadata;
     private Supplier<byte[]> mGetMetadataResponse;
     private Supplier<byte[]> mGetBitsetResponse;
     private Function<Integer, byte[]> mGetChunkResponse;
     private Consumer<String> mPostProgressResponse;
-    private volatile ServerListener mServerListener;
-
-    public interface ServerListener {
-        void onProgressReportReceived(String deviceId, String ip, int completed, int total, int failures);
-    }
 
     public HttpServer(int port) {
         this.mPort = port;
     }
 
-    public void setServerListener(ServerListener listener) {
-        this.mServerListener = listener;
-    }
-
-    public synchronized void start(InformationMetadata metadata,
-                                   Supplier<byte[]> getMetadataResponse,
+    public synchronized void start(Supplier<byte[]> getMetadataResponse,
                                    Supplier<byte[]> getBitsetResponse,
                                    Function<Integer, byte[]> getChunkResponse,
                                    Consumer<String> postProgressResponse)
             throws IOException, IllegalArgumentException {
-        if (metadata == null || getMetadataResponse == null
-            || getBitsetResponse == null || getChunkResponse == null) {
-            throw new IllegalArgumentException("Metadata and response suppliers must not be null");
-        }
 
         if (mIsRunning.get()) {
             return;
         }
 
-        this.mMetadata = metadata;
         this.mGetMetadataResponse = getMetadataResponse;
         this.mGetBitsetResponse = getBitsetResponse;
         this.mGetChunkResponse = getChunkResponse;
         this.mPostProgressResponse = postProgressResponse;
 
-        // Limiting thread pool to avoid overwhelming CPU/network
         mServerSocket = new ServerSocket(mPort);
         mIsRunning.set(true);
 
@@ -130,7 +101,7 @@ public class HttpServer {
 
     private void handleClient(Socket socket) {
         try (socket) {
-            socket.setSoTimeout(REQUEST_TIMEOUT);
+            socket.setSoTimeout(HttpUtils.REQUEST_TIMEOUT_MS);
             socket.setTcpNoDelay(true);
             String clientIp = socket.getInetAddress() != null
                     ? socket.getInetAddress().getHostAddress() : "";
@@ -167,7 +138,7 @@ public class HttpServer {
 
         String[] parts = requestLine.split(" ");
         if (parts.length < 2) {
-            responseCode(os, RESPONSE_ERROR_REQUEST_CORRUPTED, "Bad Request", false);
+            responseCode(os, HttpURLConnection.HTTP_BAD_REQUEST, "Bad Request", false);
             return false;
         }
 
@@ -198,45 +169,45 @@ public class HttpServer {
         }
 
         switch (method) {
-            case GET:{
+            case HttpUtils.GET:{
                 switch (path) {
-                    case "/metadata": {
+                    case HttpUtils.GetEndpoints.METADATA: {
                         response(os, mGetMetadataResponse, keepAlive);
                         break;
                     }
-                    case "/bitset": {
+                    case HttpUtils.GetEndpoints.BITSET: {
                         response(os, mGetBitsetResponse, keepAlive);
                         break;
                     }
-                    case "/chunk": {
+                    case HttpUtils.GetEndpoints.CHUNK: {
                         int chunkId = Integer.parseInt(query.replace("id=", ""));
                         response(os, () -> mGetChunkResponse.apply(chunkId), keepAlive);
                         break;
                     }
                     default: {
                         Log.e(TAG, "Unsupported GET path: " + path);
-                        responseCode(os, RESPONSE_ERROR_UNSUPPORTED, "Not Found", false);
+                        responseCode(os, HttpURLConnection.HTTP_UNSUPPORTED_TYPE, "Not Found", false);
                         return false;
                     }
                 }
                 break;
             }
-            case POST:{
+            case HttpUtils.POST:{
                 String body = preprocessPostRequest(reader, contentLength);
                 switch (path) {
-                    case "/progress": {
+                    case HttpUtils.PostEndpoints.PROGRESS: {
                         mPostProgressResponse.accept(body);
-                        responseCode(os, RESPONSE_SUCCESS, "OK", keepAlive);
+                        responseCode(os, HttpURLConnection.HTTP_OK, "OK", keepAlive);
                         break;
                     }
-                    case "/status": {
+                    case HttpUtils.PostEndpoints.STATUS: {
                         Log.d(TAG, "Have not implemented!!!");
-                        responseCode(os, RESPONSE_ERROR_UNSUPPORTED, "Not Found", false);
+                        responseCode(os, HttpURLConnection.HTTP_NOT_IMPLEMENTED, "Have not implemented!!!", false);
                         return false;
                     }
                     default: {
                         Log.e(TAG, "Unsupported POST path: " + path);
-                        responseCode(os, RESPONSE_ERROR_UNSUPPORTED, "Not Found", false);
+                        responseCode(os, HttpURLConnection.HTTP_UNSUPPORTED_TYPE, "Not Found", false);
                         return false;
                     }
                 }
@@ -270,19 +241,14 @@ public class HttpServer {
     }
 
     private void response(OutputStream os, Supplier<byte[]> getResponse, boolean keepAlive) throws Exception {
-        if (mMetadata == null) {
-            responseCode(os, 500, "Metadata not available", false);
-            return;
-        }
-
         byte[] bytes = getResponse.get();
 
-        String responseHeaders = "HTTP/1.1 200 OK\r\n" +
+        String responseHeaders = "HTTP/1.1 " + HttpURLConnection.HTTP_OK + " OK\r\n" +
                 "Content-Type: application/json\r\n" +
                 "Content-Length: " + bytes.length + "\r\n" +
                 "Connection: " + (keepAlive ? "keep-alive" : "close") + "\r\n\r\n";
 
-        os.write(responseHeaders.getBytes("UTF-8"));
+        os.write(responseHeaders.getBytes(StandardCharsets.UTF_8));
         os.write(bytes);
     }
 
@@ -290,7 +256,7 @@ public class HttpServer {
         String resp = "HTTP/1.1 " + code + " " + msg + "\r\n" +
                 "Content-Length: " + msg.length() + "\r\n" +
                 "Connection: " + (keepAlive ? "keep-alive" : "close") + "\r\n\r\n" + msg;
-        os.write(resp.getBytes("UTF-8"));
+        os.write(resp.getBytes(StandardCharsets.UTF_8));
     }
 
 }

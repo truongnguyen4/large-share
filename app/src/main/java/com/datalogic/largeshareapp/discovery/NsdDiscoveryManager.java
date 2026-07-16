@@ -71,7 +71,7 @@ public class NsdDiscoveryManager {
             @Override
             public void onServiceRegistered(NsdServiceInfo sInfo) {
                 registeredNames.put(serviceType, sInfo.getServiceName());
-                Log.d(TAG, "NSD Service (" + serviceType + ") registered successfully: " + sInfo.getServiceName() + " on port " + port);
+                Log.d(TAG, "NSD Service (" + serviceType + ") registered successfully on port " + port);
             }
 
             @Override

@@ -15,7 +15,7 @@ public class PerformanceTracker {
         Pair<Long, Long> startEndPair = performanceMetrics.get(name);
         if (startEndPair != null) {
             performanceMetrics.put(name, new Pair<>(startEndPair.first, endTime));
-            Log.d("PerformanceTracker", "Recorded duration for " + name + ": " + (endTime - startEndPair.first) + " ms");
+            // Log.d("PerformanceTracker", "Recorded duration for " + name + ": " + (endTime - startEndPair.first) + " ms");
         }
     }
 
@@ -24,6 +24,6 @@ public class PerformanceTracker {
         if (startEndPair != null && startEndPair.first != null && startEndPair.second != null) {
             return startEndPair.second - startEndPair.first;
         }
-        return -1; // Return -1 if the duration cannot be calculated
+        return -1;
     }
 }

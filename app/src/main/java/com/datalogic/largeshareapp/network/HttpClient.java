@@ -4,6 +4,7 @@ import android.util.Log;
 
 import com.datalogic.largeshareapp.manager.PerformanceTracker;
 import com.datalogic.largeshareapp.manager.SecureManager;
+import com.datalogic.largeshareapp.model.BitSetMetadata;
 import com.datalogic.largeshareapp.model.InformationMetadata;
 
 import org.json.JSONObject;
@@ -13,23 +14,19 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.util.BitSet;
 
 public class HttpClient {
     private static final String TAG = "HttpClient";
-    public static final int CONNECT_TIMEOUT = 5000;  // 5 seconds
-    public static final int READ_TIMEOUT = 5000;     // 5 seconds
 
-    /**
-     * Download file metadata from a distributor node.
-     */
     public static InformationMetadata fetchInformationMetadata(String ip, int port) throws Exception {
-        String urlString = "http://" + ip + ":" + port + "/metadata";
+        String urlString = HttpUtils.buildUrl(ip, port, HttpUtils.GetEndpoints.METADATA);
         URL url = new URL(urlString);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setConnectTimeout(CONNECT_TIMEOUT);
-        conn.setReadTimeout(READ_TIMEOUT);
-        conn.setRequestMethod(HttpServer.GET);
+        conn.setConnectTimeout(HttpUtils.CONNECT_TIMEOUT_MS);
+        conn.setReadTimeout(HttpUtils.READ_TIMEOUT_MS);
+        conn.setRequestMethod(HttpUtils.GET);
 
         int code = conn.getResponseCode();
         if (code != HttpURLConnection.HTTP_OK) {
@@ -47,17 +44,17 @@ public class HttpClient {
         is.close();
         conn.disconnect();
         
-        String json = baos.toString("UTF-8");
+        String json = baos.toString(StandardCharsets.UTF_8);
         return InformationMetadata.fromJsonString(json);
     }
 
     public static BitSet fetchBitSet(String ip, int port) throws Exception {
-        String urlString = "http://" + ip + ":" + port + "/bitset";
+        String urlString = HttpUtils.buildUrl(ip, port, HttpUtils.GetEndpoints.BITSET);
         URL url = new URL(urlString);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setConnectTimeout(CONNECT_TIMEOUT);
-        conn.setReadTimeout(READ_TIMEOUT);
-        conn.setRequestMethod(HttpServer.GET);
+        conn.setConnectTimeout(HttpUtils.CONNECT_TIMEOUT_MS);
+        conn.setReadTimeout(HttpUtils.READ_TIMEOUT_MS);
+        conn.setRequestMethod(HttpUtils.GET);
 
         int code = conn.getResponseCode();
         if (code != HttpURLConnection.HTTP_OK) {
@@ -75,9 +72,12 @@ public class HttpClient {
         is.close();
         conn.disconnect();
 
-        String json = baos.toString("UTF-8").trim();
+        String json = baos.toString(StandardCharsets.UTF_8).trim();
+        if (json.isEmpty()) {
+            return new BitSet();
+        }
         JSONObject jsonObject = new JSONObject(json);
-        String bitSetStr = jsonObject.optString("availableChunks", "");
+        String bitSetStr = jsonObject.optString(BitSetMetadata.AVAILABLE_CHUNKS_KEY, "");
         return SecureManager.convertStringToBitSet(bitSetStr);
     }
 
@@ -85,12 +85,12 @@ public class HttpClient {
      * Fetch raw binary bytes of a specific chunk.
      */
     public static byte[] fetchChunk(String ip, int port, int chunkId) throws Exception {
-        String urlString = "http://" + ip + ":" + port + "/chunk?id=" + chunkId;
+        String urlString = HttpUtils.buildUrl(ip, port, HttpUtils.GetEndpoints.CHUNK + "?id=" + chunkId);
         URL url = new URL(urlString);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setConnectTimeout(CONNECT_TIMEOUT);
-        conn.setReadTimeout(READ_TIMEOUT);
-        conn.setRequestMethod(HttpServer.GET);
+        conn.setConnectTimeout(HttpUtils.CONNECT_TIMEOUT_MS);
+        conn.setReadTimeout(HttpUtils.READ_TIMEOUT_MS);
+        conn.setRequestMethod(HttpUtils.GET);
 
         int code = conn.getResponseCode();
         if (code != HttpURLConnection.HTTP_OK) {
@@ -101,7 +101,6 @@ public class HttpClient {
         int contentLength = conn.getContentLength();
         InputStream is = conn.getInputStream();
 
-        PerformanceTracker.startRecord("readChunkResponse-" + chunkId, System.currentTimeMillis());
         // Use an sized stream to avoid unnecessary growing allocation
         ByteArrayOutputStream baos = contentLength > 0
                 ? new ByteArrayOutputStream(contentLength)
@@ -114,9 +113,6 @@ public class HttpClient {
         }
         PerformanceTracker.endRecord("readChunkResponse-" + chunkId, System.currentTimeMillis());
 
-        // Close the stream but do NOT disconnect(): fully reading then closing the
-        // stream returns the socket to HttpURLConnection's keep-alive pool so the
-        // next chunk reuses it, skipping a TCP handshake + slow-start per chunk.
         is.close();
         return baos.toByteArray();
     }
@@ -127,34 +123,29 @@ public class HttpClient {
      */
     private static void drainErrorStream(HttpURLConnection conn) {
         InputStream es = conn.getErrorStream();
-        if (es == null) {
-            return;
-        }
-        try {
+        try (es) {
+            if (es == null) {
+                return;
+            }
             byte[] buffer = new byte[2048];
             while (es.read(buffer) != -1) {
                 // discard
             }
         } catch (Exception ignored) {
             // best-effort drain
-        } finally {
-            try {
-                es.close();
-            } catch (Exception ignored) {
-            }
         }
     }
 
     /**
      * Send progress status reporting to Root device.
      */
-    public static void reportProgress(String ip, int port, String deviceId, int completed, int total, int failures) throws Exception {
-        String urlString = "http://" + ip + ":" + port + "/progress";
+    public static void reportProgress(String ip, int port, String deviceId, int completed, int total) throws Exception {
+        String urlString = HttpUtils.buildUrl(ip, port, HttpUtils.PostEndpoints.PROGRESS);
         URL url = new URL(urlString);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setConnectTimeout(HttpClient.CONNECT_TIMEOUT);
-        conn.setReadTimeout(HttpClient.READ_TIMEOUT);
-        conn.setRequestMethod(HttpServer.POST);
+        conn.setConnectTimeout(HttpUtils.CONNECT_TIMEOUT_MS);
+        conn.setReadTimeout(HttpUtils.READ_TIMEOUT_MS);
+        conn.setRequestMethod(HttpUtils.POST);
         conn.setRequestProperty("Content-Type", "application/json");
         conn.setDoOutput(true);
 
@@ -162,9 +153,8 @@ public class HttpClient {
         payload.put("deviceId", deviceId);
         payload.put("completed", completed);
         payload.put("total", total);
-        payload.put("failures", failures);
 
-        byte[] postBytes = payload.toString().getBytes("UTF-8");
+        byte[] postBytes = payload.toString().getBytes(StandardCharsets.UTF_8);
         OutputStream os = conn.getOutputStream();
         os.write(postBytes);
         os.flush();

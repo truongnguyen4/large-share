@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:gravity="center_vertical"
+    android:background="?android:attr/selectableItemBackground"
+    android:paddingTop="10dp"
+    android:paddingBottom="10dp"
+    android:paddingStart="4dp"
+    android:paddingEnd="4dp">
+
+    <CheckBox
+        android:id="@+id/cb_peer_filter"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:clickable="false"
+        android:focusable="false"
+        android:layout_marginEnd="8dp"/>
+
+    <TextView
+        android:id="@+id/tv_peer_filter_label"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:text="Peer"
+        android:textSize="14sp"
+        android:textColor="#212121"
+        android:ellipsize="middle"
+        android:maxLines="1"/>
+
+    <TextView
+        android:id="@+id/tv_peer_filter_percent"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="0%"
+        android:textSize="12sp"
+        android:textStyle="bold"
+        android:textColor="#1976D2"/>
+</LinearLayout>
