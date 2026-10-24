@@ -11,7 +11,7 @@ import androidx.annotation.NonNull;
 import androidx.recyclerview.widget.RecyclerView;
 
 import com.datalogic.largeshareapp.R;
-import com.datalogic.largeshareapp.manager.ShareManager.PeerProgress;
+import com.datalogic.largeshareapp.service.SessionSnapshot.PeerProgress;
 
 import java.util.ArrayList;
 import java.util.Collections;

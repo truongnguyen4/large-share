@@ -29,6 +29,10 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
+    testOptions {
+        // android.util.Log etc. return defaults in plain JVM unit tests.
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
@@ -38,4 +42,8 @@ dependencies {
     implementation(libs.activity)
     implementation(libs.constraintlayout)
     implementation(libs.core)
+
+    testImplementation(libs.junit)
+    // Real org.json for JVM tests (the Android stubs only throw).
+    testImplementation("org.json:json:20231013")
 }

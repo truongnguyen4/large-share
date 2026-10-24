@@ -1,22 +1,25 @@
 package com.datalogic.largeshareapp;
 
 import android.Manifest;
+import android.content.ComponentName;
+import android.content.Context;
 import android.content.Intent;
+import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
-import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
-import android.os.Handler;
-import android.os.Looper;
+import android.os.IBinder;
 import android.provider.Settings;
 import android.text.Editable;
 import android.text.TextWatcher;
+import android.text.method.PasswordTransformationMethod;
 import android.util.Log;
 import android.view.View;
 import android.widget.ArrayAdapter;
 import android.widget.AutoCompleteTextView;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.ProgressBar;
 import android.widget.RadioGroup;
 import android.widget.TextView;
@@ -33,15 +36,14 @@ import androidx.core.content.ContextCompat;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
-import com.datalogic.largeshareapp.manager.SecureManager;
-import com.datalogic.largeshareapp.manager.SeedManager;
-import com.datalogic.largeshareapp.manager.SeekManager;
-import com.datalogic.largeshareapp.manager.ShareManager;
-import com.datalogic.largeshareapp.model.InformationMetadata;
+import com.datalogic.largeshareapp.service.SessionConfig;
+import com.datalogic.largeshareapp.service.SessionSnapshot;
+import com.datalogic.largeshareapp.service.SessionSnapshot.PeerProgress;
+import com.datalogic.largeshareapp.service.ShareApi;
+import com.datalogic.largeshareapp.service.ShareService;
 import com.datalogic.largeshareapp.ui.PeerFilterAdapter;
 import com.datalogic.largeshareapp.ui.PeerProgressAdapter;
 
-import java.io.File;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -49,22 +51,30 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
 
-public class MainActivity extends AppCompatActivity {
+/**
+ * Thin client of {@link ShareService}: it binds to the service, sends commands through
+ * {@link ShareApi} and renders every {@link SessionSnapshot} it receives. Sessions keep running
+ * in the service when this activity is closed or recreated.
+ */
+public class MainActivity extends AppCompatActivity implements ShareApi.Listener {
     private static final String TAG = "MainActivity";
     private static final int PERMISSION_REQUEST_CODE = 456;
 
-    private final AtomicBoolean mIsSharing = new AtomicBoolean(false);
-    private ShareManager.DiscoveryMode mDiscoveryMode = ShareManager.DiscoveryMode.NSD;
-    private ShareManager.DiscoveryRole mDiscoveryRole = ShareManager.DiscoveryRole.SEEKER;
-    private final Handler mHandler = new Handler(Looper.getMainLooper());
     // UI Widgets
     private RadioGroup rgDiscovery;
     private RadioGroup rgRole;
     private Button btnAction;
+    private TextView tvStatus;
+    private EditText etFleetKey;
+    private Button btnShowFleetKey;
+    private boolean mFleetKeyVisible;
+    private EditText etStaticPeers;
+    // Where peers can reach this device
+    private TextView tvDeviceIp;
+    private TextView tvDeviceMeta;
     // Seeker's own download progress (visible only in Seeker role)
     private CardView cvSeekerProgress;
     private ProgressBar pbSeeker;
@@ -78,15 +88,13 @@ public class MainActivity extends AppCompatActivity {
     private TextView tvCompletionInfo;
     private final PeerProgressAdapter peersAdapter = new PeerProgressAdapter();
 
-    // Peer search / filter
+    // Peer search / filter (pure UI state)
     private CardView cvPeers;
     private Button btnPeerFilter;
     private TextView tvPeerFilterStatus;
     private TextView tvPeerFilterClear;
-    private ArrayAdapter<String> peerSearchAdapter;
     private final Set<String> mPeerFilter = new HashSet<>();
-    private Map<String, ShareManager.PeerProgress> mLastProgressMap = Collections.emptyMap();
-    private final Map<String, ShareManager.PeerProgress> mPeerProgressMap = new HashMap<>();
+    private Map<String, PeerProgress> mLastProgressMap = Collections.emptyMap();
     private View llFilePickerContainer;
     private Button btnSelectFile;
     private TextView tvSelectedFileInfo;
@@ -97,44 +105,37 @@ public class MainActivity extends AppCompatActivity {
     private View nsvMetadataDetails;
     private boolean mFileDetailsExpanded = false;
 
-    // Seeder view: progress reported by other (leeching) peers.
-    private final SeedManager.PeersTrackingListener mPeersTrackingListener = new SeedManager.PeersTrackingListener() {
-        @Override
-        public void onProgressUpdated(String deviceId, int completed, int total) {
-            renderPeerTracker(deviceId, completed, total);
-        }
-    };
+    // Service connection
+    private ShareApi mApi;
+    private SessionSnapshot mSnapshot;
+    private Intent mPendingLaunch;
+    private String mRenderedFileHash;
+    private String mLastMessage;
+    private int mGroupCapacity;
 
-    // Seeker view: this device's own leeching progress.
-    private final SeekManager.SeekEventListener mSeekEventListener = new SeekManager.SeekEventListener() {
+    private final ServiceConnection mConnection = new ServiceConnection() {
         @Override
-        public void onChunkBatchLeeched(int completed, int total) {
-            renderSeekProgress(completed, total);
+        public void onServiceConnected(ComponentName name, IBinder binder) {
+            mApi = ((ShareService.LocalBinder) binder).api();
+            if (etFleetKey.getText().length() == 0) {
+                etFleetKey.setText(mApi.getFleetKey());
+            }
+            mApi.addListener(MainActivity.this);
+            applyPendingLaunch();
         }
 
         @Override
-        public void onLeechingCompleted() {
-            runOnUiThread(() -> {
-                tvCompletionInfo.setText("Download completed. Staying in the share session for a while to help other peers.");
-                tvCompletionInfo.setVisibility(View.VISIBLE);
-            });
-            mHandler.postDelayed(() -> {
-                tvCompletionInfo.setText("Left the share session. Get out network");
-                tvCompletionInfo.setVisibility(View.VISIBLE);
-                btnAction.setText("Start sharing");
-            }, ShareManager.STOP_SEED_DELAY_MS);
+        public void onServiceDisconnected(ComponentName name) {
+            mApi = null;
         }
     };
 
     private final ActivityResultLauncher<String> filePickerLauncher =
         registerForActivityResult(new ActivityResultContracts.GetContent(), uri -> {
-            if (uri != null) {
-                parseFileSelection(uri);
+            if (uri != null && mApi != null) {
+                mApi.prepareFile(uri);
             }
         });
-
-    private ShareManager shareManager;
-    private File mFileShared;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -144,6 +145,13 @@ public class MainActivity extends AppCompatActivity {
         // Map widgets
         rgDiscovery = findViewById(R.id.rg_discovery);
         rgRole = findViewById(R.id.rg_role);
+        tvStatus = findViewById(R.id.tv_status);
+        etFleetKey = findViewById(R.id.et_fleet_key);
+        btnShowFleetKey = findViewById(R.id.btn_show_fleet_key);
+        btnShowFleetKey.setOnClickListener(v -> setFleetKeyVisible(!mFleetKeyVisible));
+        etStaticPeers = findViewById(R.id.et_static_peers);
+        tvDeviceIp = findViewById(R.id.tv_device_ip);
+        tvDeviceMeta = findViewById(R.id.tv_device_meta);
 
         btnAction = findViewById(R.id.btn_distribute);
 
@@ -165,8 +173,6 @@ public class MainActivity extends AppCompatActivity {
         tvPeerFilterStatus = findViewById(R.id.tv_peer_filter_status);
         tvPeerFilterClear = findViewById(R.id.tv_peer_filter_clear);
 
-        peerSearchAdapter = new ArrayAdapter<>(this, android.R.layout.simple_dropdown_item_1line);
-
         btnPeerFilter.setOnClickListener(v -> openPeerFilterDialog(null));
         tvPeerFilterClear.setOnClickListener(v -> clearPeerFilter());
 
@@ -185,53 +191,131 @@ public class MainActivity extends AppCompatActivity {
 
         initialize();
         checkAndRequestPermissions();
+        mPendingLaunch = getIntent();
+        // Bound for the whole life of the activity (not only while visible), so a session requested
+        // by a launch intent starts even when the screen is off, e.g. on an unattended device.
+        bindService(new Intent(this, ShareService.class), mConnection, Context.BIND_AUTO_CREATE);
+    }
+
+    @Override
+    protected void onStop() {
+        // The key is the fleet's only credential: never leave it on screen in the background.
+        setFleetKeyVisible(false);
+        super.onStop();
+    }
+
+    @Override
+    protected void onDestroy() {
+        // The session keeps running in the service; we only stop listening.
+        if (mApi != null) {
+            mApi.removeListener(this);
+            mApi = null;
+        }
+        unbindService(mConnection);
+        super.onDestroy();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        mPendingLaunch = intent;
+        applyPendingLaunch();
+    }
+
+    /**
+     * Lets a session be configured and started from the command line (used by automated device
+     * tests): adb shell am start -n .../.MainActivity --es role root|seeker --es mode nsd|wifidirect
+     * --es file /sdcard/x.bin --es key secret --es peers 10.0.0.5:8888 --ei capacity 3
+     * --ez autostart true
+     * <p>
+     * {@code --ez stop true} ends the running session cleanly (unlike a force-stop, it also tears
+     * down this device's Wi-Fi Direct group, which would otherwise outlive the process).
+     */
+    private void applyPendingLaunch() {
+        Intent intent = mPendingLaunch;
+        if (mApi == null || intent == null) {
+            return;
+        }
+        if (intent.getBooleanExtra("stop", false)) {
+            mPendingLaunch = null;
+            mApi.stop();
+            return;
+        }
+        if (!intent.hasExtra("role")) {
+            return;
+        }
+        mPendingLaunch = null;
+        String key = intent.getStringExtra("key");
+        if (key != null) {
+            etFleetKey.setText(key);
+        }
+        String peers = intent.getStringExtra("peers");
+        if (peers != null) {
+            etStaticPeers.setText(peers);
+        }
+        mGroupCapacity = intent.getIntExtra("capacity", 0);
+        boolean root = "root".equalsIgnoreCase(intent.getStringExtra("role"));
+        rgRole.check(root ? R.id.rb_root : R.id.rb_seeker);
+        rgDiscovery.check("wifidirect".equalsIgnoreCase(intent.getStringExtra("mode"))
+                ? R.id.rb_wifidirect : R.id.rb_nsd);
+        String path = intent.getStringExtra("file");
+        if (intent.getBooleanExtra("autostart", false)) {
+            if (mSnapshot == null || !mSnapshot.active) {
+                mApi.start(buildConfig(root ? path : null));
+            }
+        } else if (root && path != null) {
+            mApi.prepareFile(path);
+        }
     }
 
     private void initialize() {
-        rgDiscovery.setOnCheckedChangeListener((group, checkedId)  -> {
-            if (checkedId == R.id.rb_nsd) {
-                mDiscoveryMode = ShareManager.DiscoveryMode.NSD;
-            } else if (checkedId == R.id.rb_wifidirect) {
-                mDiscoveryMode = ShareManager.DiscoveryMode.WIFI_DIRECT;
-            }
-        });
-
         rgRole.setOnCheckedChangeListener((group, checkedId) -> {
-            if (checkedId == R.id.rb_root) {
-                btnAction.setText("Share data");
-                llFilePickerContainer.setVisibility(View.VISIBLE);
-                mDiscoveryRole = ShareManager.DiscoveryRole.SEEDER;
-                cvPeers.setVisibility(View.VISIBLE);
-                cvSeekerProgress.setVisibility(View.GONE);
-            } else {
-                btnAction.setText("Seek Data");
-                llFilePickerContainer.setVisibility(View.GONE);
-                mDiscoveryRole = ShareManager.DiscoveryRole.SEEKER;
-                cvPeers.setVisibility(View.GONE);
-                cvSeekerProgress.setVisibility(View.VISIBLE);
+            applyRoleVisibility(selectedRole());
+            if (mSnapshot == null || !mSnapshot.active) {
+                btnAction.setText(selectedRole() == SessionSnapshot.Role.ROOT ? "Share data" : "Seek Data");
             }
         });
-
-        btnSelectFile.setOnClickListener(v -> {
-            filePickerLauncher.launch("*/*");
-        });
-
+        btnSelectFile.setOnClickListener(v -> filePickerLauncher.launch("*/*"));
         btnAction.setOnClickListener(v -> {
-            mIsSharing.set(!mIsSharing.get());
-            String name = mIsSharing.get() ? "Stop sharing"
-                            : (mDiscoveryRole == ShareManager.DiscoveryRole.SEEDER ? "Share data"
-                                : "Seek Data");
-
-            btnAction.setText(name);
-            toggleFreezeUI(!mIsSharing.get());
-            toggleSharing(mIsSharing.get());
+            if (mApi == null) {
+                return;
+            }
+            if (mSnapshot != null && mSnapshot.active) {
+                mApi.stop();
+            } else {
+                tvCompletionInfo.setVisibility(View.GONE);
+                mApi.start(buildConfig(null));
+            }
         });
 
         rgDiscovery.check(R.id.rb_nsd);
         rgRole.check(R.id.rb_seeker);
     }
 
-    private void toggleFreezeUI(boolean enabled) {
+    private SessionSnapshot.Role selectedRole() {
+        return rgRole.getCheckedRadioButtonId() == R.id.rb_root
+                ? SessionSnapshot.Role.ROOT : SessionSnapshot.Role.SEEKER;
+    }
+
+    private SessionSnapshot.Mode selectedMode() {
+        return rgDiscovery.getCheckedRadioButtonId() == R.id.rb_wifidirect
+                ? SessionSnapshot.Mode.WIFI_DIRECT : SessionSnapshot.Mode.NSD;
+    }
+
+    private SessionConfig buildConfig(String filePath) {
+        return new SessionConfig(selectedRole(), selectedMode(), etFleetKey.getText().toString(),
+                SessionConfig.parsePeers(etStaticPeers.getText().toString()), filePath, mGroupCapacity);
+    }
+
+    private void applyRoleVisibility(SessionSnapshot.Role role) {
+        boolean root = role == SessionSnapshot.Role.ROOT;
+        llFilePickerContainer.setVisibility(root ? View.VISIBLE : View.GONE);
+        cvPeers.setVisibility(root ? View.VISIBLE : View.GONE);
+        cvSeekerProgress.setVisibility(root ? View.GONE : View.VISIBLE);
+    }
+
+    private void setControlsEnabled(boolean enabled) {
         for (int i = 0; i < rgDiscovery.getChildCount(); i++) {
             rgDiscovery.getChildAt(i).setEnabled(enabled);
         }
@@ -239,80 +323,118 @@ public class MainActivity extends AppCompatActivity {
             rgRole.getChildAt(i).setEnabled(enabled);
         }
         btnSelectFile.setEnabled(enabled);
+        etFleetKey.setEnabled(enabled);
+        etStaticPeers.setEnabled(enabled);
     }
 
-    private void parseFileSelection(Uri uri) {
-        mFileShared = new File("/sdcard/file-shared.zip");
-        toggleFreezeUI(false);
-        Executors.newSingleThreadExecutor().execute(() -> {
-            InformationMetadata informationMetadata = SecureManager.createFileMetadata(
-                    mFileShared,
-                    SecureManager.CHUNK_SIZE_524KB);
+    // ------------------------------------------------------------------ rendering
 
-            runOnUiThread(() -> {
-                tvSelectedFileInfo.setText( uri.getPath());
-                if (informationMetadata != null) {
-                    showMetadataInfo(informationMetadata);
+    @Override
+    public void onSnapshot(SessionSnapshot s) {
+        mSnapshot = s;
+        if (s.active) {
+            // Reflect the running session (e.g. after reopening the app while it runs in background).
+            rgRole.check(s.role == SessionSnapshot.Role.ROOT ? R.id.rb_root : R.id.rb_seeker);
+            rgDiscovery.check(s.mode == SessionSnapshot.Mode.WIFI_DIRECT ? R.id.rb_wifidirect : R.id.rb_nsd);
+        }
+        applyRoleVisibility(s.active ? s.role : selectedRole());
+        setControlsEnabled(!s.active && !s.preparing);
+        btnAction.setEnabled(s.active || !s.preparing);
+        btnAction.setText(s.active ? "Stop sharing"
+                : selectedRole() == SessionSnapshot.Role.ROOT ? "Share data" : "Seek Data");
+        tvStatus.setText(s.phase + " - " + s.detail);
+
+        if (s.message != null && !s.message.equals(mLastMessage)) {
+            Toast.makeText(this, s.message, Toast.LENGTH_SHORT).show();
+        }
+        mLastMessage = s.message;
+
+        renderDevice(s);
+        renderFile(s);
+        renderSeekProgress(s);
+        renderCompletion(s);
+        renderPeerProgress(s.peers);
+    }
+
+    /** Shows the fleet key in clear text (e.g. to copy it to another device) or masks it again. */
+    private void setFleetKeyVisible(boolean visible) {
+        mFleetKeyVisible = visible;
+        int cursor = etFleetKey.getSelectionEnd();
+        etFleetKey.setTransformationMethod(visible ? null : PasswordTransformationMethod.getInstance());
+        etFleetKey.setSelection(Math.max(0, Math.min(cursor, etFleetKey.length())));
+        btnShowFleetKey.setText(visible ? "Hide" : "Show");
+    }
+
+    /** IP addresses (one per line, aligned) so the user can read them out or type them as static peers. */
+    private void renderDevice(SessionSnapshot s) {
+        if (s.addresses.isEmpty()) {
+            tvDeviceIp.setText("IP: not connected to any network");
+        } else {
+            StringBuilder sb = new StringBuilder();
+            for (SessionSnapshot.NetAddress a : s.addresses) {
+                if (sb.length() > 0) {
+                    sb.append('\n');
                 }
-                toggleFreezeUI(true);
-            });
-        });
-    }
-
-    private void toggleSharing(boolean isSharing) {
-        if (!isSharing) {
-            if (shareManager != null) {
-                shareManager.stopSharing();
-                shareManager = null;
-                btnAction.setText(rgRole.getCheckedRadioButtonId() == R.id.rb_root ? "Share data" : "Seek Data");
+                sb.append(String.format(Locale.US, "%-15s  %s", a.ip, a.label));
             }
-            Log.d(TAG, "Stopped sharing");
-            return;
+            tvDeviceIp.setText(sb.toString());
         }
+        tvDeviceMeta.setText(String.format(Locale.US, "Port %d  •  Device %s", s.servePort,
+                PeerProgressAdapter.shortId(s.deviceId)));
+    }
 
-        if (mDiscoveryMode == ShareManager.DiscoveryMode.UNKNOWN
-                || mDiscoveryRole == ShareManager.DiscoveryRole.UNKNOWN) {
-            Log.w(TAG, "Cannot start sharing: Discovery mode or role is not set.");
-            return;
-        }
-
-        Log.d(TAG, "Starting sharing - Mode: " + mDiscoveryMode);
-        shareManager = new ShareManager(MainActivity.this, mFileShared, mDiscoveryMode);
-        shareManager.startSharing(mDiscoveryRole);
-        if (mDiscoveryRole == ShareManager.DiscoveryRole.SEEDER) {
-            shareManager.trackSharing();
-            shareManager.addPeersTrackingListener(mPeersTrackingListener);
-        }
-        if (mDiscoveryRole == ShareManager.DiscoveryRole.SEEKER) {
-            shareManager.addSeekEventListener(mSeekEventListener);
+    private void renderFile(SessionSnapshot s) {
+        if (s.preparing) {
+            tvSelectedFileInfo.setText(String.format(Locale.US, "Hashing... %d%%", s.preparePercent));
+        } else if (s.file != null) {
+            tvSelectedFileInfo.setText(s.file.name + "  •  " + formatSize(s.file.size));
+            if (!Objects.equals(mRenderedFileHash, s.file.fileHash)) {
+                mRenderedFileHash = s.file.fileHash;
+                showMetadataInfo(s.file);
+            }
+        } else {
+            tvSelectedFileInfo.setText("Selected file: None");
         }
     }
 
-    private void renderSeekProgress(int completed, int total) {
-        runOnUiThread(() -> {
-            int percent = total > 0 ? (int) Math.round((completed * 100.0) / total) : 0;
-            pbSeeker.setMax(100);
-            pbSeeker.setProgress(percent);
-            tvSeekerPercent.setText(String.format(Locale.getDefault(), "%d%%", percent));
+    private void renderSeekProgress(SessionSnapshot s) {
+        int percent = s.percent();
+        pbSeeker.setMax(100);
+        pbSeeker.setProgress(percent);
+        tvSeekerPercent.setText(String.format(Locale.getDefault(), "%d%%", percent));
+        if (s.totalChunks == 0) {
+            tvSeekerProgress.setText("Waiting to leech chunks…");
+        } else {
             tvSeekerProgress.setText(String.format(Locale.getDefault(),
-                    "Chunks: %d / %d downloaded", completed, total));
-        });
+                    "Chunks: %d / %d downloaded • %.1f MB/s • %d peer(s)", s.completedChunks,
+                    s.totalChunks, s.bytesPerSec / (1024 * 1024), s.activePeers));
+        }
     }
 
-    private void renderPeerTracker(String deviceId, int completed, int total) {
-        runOnUiThread(() -> {
-            mPeerProgressMap.put(deviceId,
-                    new ShareManager.PeerProgress("deviceId", completed, total, deviceId));
-            renderPeerProgress(mPeerProgressMap);
-        });
+    private void renderCompletion(SessionSnapshot s) {
+        switch (s.phase) {
+            case COMPLETED:
+                tvCompletionInfo.setText("Download completed and verified. Staying in the share session "
+                        + "for a while to help other peers.");
+                tvCompletionInfo.setVisibility(View.VISIBLE);
+                break;
+            case LEFT:
+                tvCompletionInfo.setText("Left the share session.");
+                tvCompletionInfo.setVisibility(View.VISIBLE);
+                break;
+            default:
+                if (s.active) {
+                    tvCompletionInfo.setVisibility(View.GONE);
+                }
+                break;
+        }
     }
 
-    private void renderPeerProgress(Map<String, ShareManager.PeerProgress> progressMap) {
+    private void renderPeerProgress(Map<String, PeerProgress> progressMap) {
         mLastProgressMap = progressMap;
-        refreshPeerSuggestions(progressMap);
         updateFilterStatus();
 
-        Map<String, ShareManager.PeerProgress> display = applyPeerFilter(progressMap);
+        Map<String, PeerProgress> display = applyPeerFilter(progressMap);
 
         if (display.isEmpty()) {
             rvPeers.setVisibility(View.GONE);
@@ -333,10 +455,9 @@ public class MainActivity extends AppCompatActivity {
         int shown = display.size();
         int completedPeers = 0;
         double pctSum = 0.0;
-        for (ShareManager.PeerProgress p : display.values()) {
-            double pct = p.total > 0 ? ((double) p.completed / p.total) * 100.0 : 0.0;
-            pctSum += pct;
-            if (p.total > 0 && p.completed >= p.total) {
+        for (PeerProgress p : display.values()) {
+            pctSum += p.total > 0 ? ((double) p.completed / p.total) * 100.0 : 0.0;
+            if (p.isDone()) {
                 completedPeers++;
             }
         }
@@ -353,25 +474,17 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /** Restricts the map to the ticked peer ids; an empty filter means "show all". */
-    private Map<String, ShareManager.PeerProgress> applyPeerFilter(
-            Map<String, ShareManager.PeerProgress> src) {
+    private Map<String, PeerProgress> applyPeerFilter(Map<String, PeerProgress> src) {
         if (mPeerFilter.isEmpty()) {
             return src;
         }
-        Map<String, ShareManager.PeerProgress> out = new HashMap<>();
-        for (Map.Entry<String, ShareManager.PeerProgress> entry : src.entrySet()) {
+        Map<String, PeerProgress> out = new HashMap<>();
+        for (Map.Entry<String, PeerProgress> entry : src.entrySet()) {
             if (mPeerFilter.contains(entry.getKey())) {
                 out.put(entry.getKey(), entry.getValue());
             }
         }
         return out;
-    }
-
-    /** Keeps the search bar's autocomplete suggestions in sync with known peers. */
-    private void refreshPeerSuggestions(Map<String, ShareManager.PeerProgress> progressMap) {
-        peerSearchAdapter.clear();
-        peerSearchAdapter.addAll(progressMap.keySet());
-        peerSearchAdapter.notifyDataSetChanged();
     }
 
     private void updateFilterStatus() {
@@ -391,18 +504,16 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void openPeerFilterDialog(String initialQuery) {
-        final Map<String, ShareManager.PeerProgress> peers = mLastProgressMap;
+        final Map<String, PeerProgress> peers = mLastProgressMap;
         if (peers.isEmpty()) {
             Toast.makeText(this, "No peers to filter yet.", Toast.LENGTH_SHORT).show();
             return;
         }
 
         List<PeerFilterAdapter.Item> items = new ArrayList<>();
-        for (Map.Entry<String, ShareManager.PeerProgress> entry : peers.entrySet()) {
-            ShareManager.PeerProgress p = entry.getValue();
-            int percent = p.total > 0 ? (int) Math.round((p.completed * 100.0) / p.total) : 0;
-            items.add(new PeerFilterAdapter.Item(
-                    entry.getKey(), "Peer " + PeerProgressAdapter.shortId(entry.getKey()), percent));
+        for (Map.Entry<String, PeerProgress> entry : peers.entrySet()) {
+            items.add(new PeerFilterAdapter.Item(entry.getKey(),
+                    "Peer " + PeerProgressAdapter.shortId(entry.getKey()), entry.getValue().percent()));
         }
 
         // Pre-tick the active filter, or everything when no filter is set yet.
@@ -456,23 +567,33 @@ public class MainActivity extends AppCompatActivity {
         renderPeerProgress(mLastProgressMap);
     }
 
-    private void showMetadataInfo(InformationMetadata meta) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("=== PRE-SPLIT CHUNK DETAILS ===\n");
-        sb.append(String.format(Locale.getDefault(), "[File]: \n%s\n", meta.getFileShared().getPath()));
-        sb.append(String.format(Locale.getDefault(), "[Hash](SHA-256): \n%s\n", meta.getFileHash()));
-        sb.append(String.format(Locale.getDefault(), "[Size]: %.2f MB\n", (double) meta.getFileSize() / (1024 * 1024)));
-        sb.append(String.format(Locale.getDefault(), "[Chunks]: %d chunks\n", meta.getChunkHashes().length));
-        sb.append(String.format(Locale.getDefault(), "[Chunk]: %d bytes\n", meta.getChunkSize()));
-        sb.append("\n---------------------------------\n");
-        String[] hashes = meta.getChunkHashes();
-        sb.append("Expected SHA-256 Hashes Table:\n");
-        for (int i = 0; i < hashes.length; i++) {
-            sb.append(String.format(Locale.getDefault(), "Chunk %d: \n%s\n", i, hashes[i]));
+    /** Host view of the payload: what will be shared, without the per-chunk hash table. */
+    private void showMetadataInfo(SessionSnapshot.FileInfo file) {
+        int slash = file.path.lastIndexOf('/');
+        String folder = slash > 0 ? file.path.substring(0, slash) : file.path;
+        String chunks = String.format(Locale.US, "%,d × %s", file.chunkCount, formatSize(file.chunkSize));
+        if (file.chunkCount > 0 && file.lastChunkSize() != file.chunkSize) {
+            chunks += " (last " + formatSize(file.lastChunkSize()) + ")";
         }
-        tvMetadataDetails.setText(sb.toString());
-        // Reveal the freshly compiled metadata.
+        String summary = String.format(Locale.US,
+                "File     %s%nFolder   %s%nSize     %s (%,d bytes)%nChunks   %s%nSHA-256  %s",
+                file.name, folder, formatSize(file.size), file.size, chunks, file.fileHash);
+        tvMetadataDetails.setText(summary);
+        // Reveal the summary of the freshly prepared file.
         setFileDetailsExpanded(true);
+    }
+
+    private static String formatSize(long bytes) {
+        if (bytes >= 1L << 30) {
+            return String.format(Locale.US, "%.2f GB", bytes / (double) (1L << 30));
+        }
+        if (bytes >= 1L << 20) {
+            return String.format(Locale.US, "%.1f MB", bytes / (double) (1L << 20));
+        }
+        if (bytes >= 1L << 10) {
+            return String.format(Locale.US, "%.0f KB", bytes / (double) (1L << 10));
+        }
+        return bytes + " B";
     }
 
     /** Expands or collapses the metadata body of the selected-file card. */
@@ -482,11 +603,15 @@ public class MainActivity extends AppCompatActivity {
         tvFileCardToggle.setText(expanded ? "▾" : "▸");
     }
 
+    // ------------------------------------------------------------------ permissions
+
     private void checkAndRequestPermissions() {
         List<String> permissions = new ArrayList<>();
         permissions.add(Manifest.permission.ACCESS_FINE_LOCATION);
         permissions.add(Manifest.permission.ACCESS_COARSE_LOCATION);
         permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES);
+        // Without it the session still runs, but its progress notification is hidden.
+        permissions.add(Manifest.permission.POST_NOTIFICATIONS);
 
         List<String> missingPermissions = new ArrayList<>();
         for (String permission : permissions) {
@@ -516,15 +641,6 @@ public class MainActivity extends AppCompatActivity {
                     Log.d(TAG, "Warning: Permission denied: " + permissions[i] + ". Discovery might not work thoroughly.");
                 }
             }
-        }
-    }
-
-    @Override
-    protected void onDestroy() {
-        super.onDestroy();
-        if (shareManager != null) {
-            shareManager.stopSharing();
-            shareManager = null;
         }
     }
 }

@@ -24,7 +24,53 @@
             android:textStyle="bold"
             android:textColor="#212121"
             android:gravity="center"
-            android:layout_marginBottom="16dp"/>
+            android:layout_marginBottom="12dp"/>
+
+        <!-- This device: where peers can reach it (refreshed live by the service) -->
+        <androidx.cardview.widget.CardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:elevation="4dp"
+            app:cardCornerRadius="8dp"
+            app:cardBackgroundColor="#FFFFFF">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="12dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="This device"
+                    android:textStyle="bold"
+                    android:textSize="15sp"
+                    android:textColor="#1976D2"
+                    android:layout_marginBottom="4dp"/>
+
+                <TextView
+                    android:id="@+id/tv_device_ip"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="IP: -"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:textColor="#212121"
+                    android:fontFamily="monospace"
+                    android:textIsSelectable="true"/>
+
+                <TextView
+                    android:id="@+id/tv_device_meta"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text=""
+                    android:textSize="12sp"
+                    android:textColor="#555555"/>
+            </LinearLayout>
+        </androidx.cardview.widget.CardView>
 
         <!-- Section 1: Discovery Mechanism & Mode selectors -->
         <androidx.cardview.widget.CardView
@@ -117,6 +163,67 @@
                         android:text="Seeker"/>
                 </RadioGroup>
 
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:background="#EEEEEE"
+                    android:layout_marginTop="4dp"
+                    android:layout_marginBottom="8dp"/>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Fleet key (identity check):"
+                    android:textStyle="bold"
+                    android:textSize="12sp"
+                    android:textColor="#555555"/>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginBottom="4dp">
+
+                    <EditText
+                        android:id="@+id/et_fleet_key"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:inputType="textPassword"
+                        android:hint="Shared fleet secret"
+                        android:textSize="13sp"
+                        android:importantForAutofill="no"/>
+
+                    <Button
+                        android:id="@+id/btn_show_fleet_key"
+                        style="?android:attr/borderlessButtonStyle"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:minWidth="64dp"
+                        android:text="Show"
+                        android:textColor="#1976D2"
+                        android:contentDescription="Show or hide the fleet key"/>
+                </LinearLayout>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Static peers (optional):"
+                    android:textStyle="bold"
+                    android:textSize="12sp"
+                    android:textColor="#555555"/>
+
+                <EditText
+                    android:id="@+id/et_static_peers"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:inputType="text"
+                    android:hint="192.168.1.10:8888, 192.168.1.11"
+                    android:textSize="13sp"
+                    android:importantForAutofill="no"
+                    android:layout_marginBottom="4dp"/>
+
                 <!-- Custom File Selector for Root Device -->
                 <LinearLayout
                     android:id="@+id/ll_file_picker_container"
@@ -194,11 +301,11 @@
                                     android:paddingStart="8dp"/>
                             </LinearLayout>
 
-                            <!-- Collapsible body: chunk / SHA-256 metadata -->
+                            <!-- Collapsible body: summary of the prepared payload -->
                             <androidx.core.widget.NestedScrollView
                                 android:id="@+id/nsv_metadata_details"
                                 android:layout_width="match_parent"
-                                android:layout_height="150dp"
+                                android:layout_height="wrap_content"
                                 android:background="#FFFFFF"
                                 android:visibility="gone">
 
@@ -207,10 +314,11 @@
                                     android:layout_width="match_parent"
                                     android:layout_height="wrap_content"
                                     android:padding="8dp"
-                                    android:text="No metadata compiled yet. Select a file or use the default to split &amp; build the chunk SHA-256 table."
-                                    android:textSize="11sp"
+                                    android:text="No file prepared yet. Select a file to split it into chunks and compute its SHA-256."
+                                    android:textSize="12sp"
                                     android:textColor="#47525E"
-                                    android:fontFamily="monospace"/>
+                                    android:fontFamily="monospace"
+                                    android:textIsSelectable="true"/>
                             </androidx.core.widget.NestedScrollView>
                         </LinearLayout>
                     </androidx.cardview.widget.CardView>
@@ -237,6 +345,18 @@
                 android:layout_marginEnd="8dp"/>
 
         </LinearLayout>
+
+        <!-- Live session status: phase, speed, peers, network state -->
+        <TextView
+            android:id="@+id/tv_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:padding="10dp"
+            android:background="#E3F2FD"
+            android:text="Idle"
+            android:textSize="13sp"
+            android:textColor="#0D47A1"/>
 
         <!-- Section 3: My Download Progress (Seeker perspective) -->
         <androidx.cardview.widget.CardView
